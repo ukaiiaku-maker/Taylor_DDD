@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+.env
+
+# Large/generated simulation outputs
+results/
+*.nohup.log
+*.log
+*.tmp
+*.bak
+
+# OS/editor
+.DS_Store
+.vscode/*.log
+
+# Jupyter
+.ipynb_checkpoints/
