@@ -1,0 +1,16 @@
+[project]
+name = "taylor-ddd"
+version = "0.1.0"
+description = "Reduced OpenDiS-style Arrhenius Taylor/Peierls DDD drivers and analysis utilities"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "tabulate",
+]
+
+[tool.ruff]
+line-length = 100
