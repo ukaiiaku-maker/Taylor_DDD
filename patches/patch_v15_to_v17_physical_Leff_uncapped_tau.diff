@@ -1,0 +1,287 @@
+--- /mnt/data/clean_arrhenius_taylor_ddd_v15.py	2026-06-10 14:53:56.700664392 +0000
++++ /mnt/data/clean_arrhenius_taylor_ddd_v17.py	2026-06-10 14:56:52.060362816 +0000
+@@ -474,6 +474,9 @@
+     n_live_tail = [_safe_float(r.get("n_live_pins"), 0.0) for r in tail]
+     cap_tail = [_safe_float(r.get("frac_tau_local_capped"), 0.0) for r in tail]
+     cap_all = [_safe_float(r.get("frac_tau_local_capped"), 0.0) for r in rows]
++    over_cap_tail = [_safe_float(r.get("frac_tau_local_over_cap_reference"), 0.0) for r in tail]
++    clipped_tail = [_safe_float(r.get("frac_tau_local_clipped"), 0.0) for r in tail]
++    leff_tail = [_safe_float(r.get("tau_local_L_eff_median_reduced"), float("nan")) for r in tail]
+     tau_local_tail = [_safe_float(r.get("tau_local_median_MPa"), 0.0) for r in tail]
+ 
+     dt = float(params.get("dt", float("nan")))
+@@ -540,6 +543,11 @@
+         "n_live_pins_tail_median": median(n_live_tail),
+         "tau_local_median_tail_MPa": median(tau_local_tail),
+         "frac_tau_local_capped_tail_median": median(cap_tail),
++        "frac_tau_local_over_cap_reference_tail_median": median(over_cap_tail),
++        "frac_tau_local_clipped_tail_median": median(clipped_tail),
++        "tau_local_L_eff_tail_median_reduced": median(leff_tail),
++        "tau_local_cap_mode": params.get("tau_local_cap_mode"),
++        "tau_local_length_mode": params.get("tau_local_length_mode"),
+         "frac_tau_local_capped_max": max(finite(cap_all)) if finite(cap_all) else float("nan"),
+         "max_crossing_rate_dt": max(finite(rdt_vals)) if finite(rdt_vals) else float("nan"),
+         "tail_crossing_rate_dt_median": median(rdt_vals[-tail_n:]) if rdt_vals else float("nan"),
+@@ -554,8 +562,10 @@
+     warnings = []
+     if summary["max_crossing_rate_dt"] and math.isfinite(summary["max_crossing_rate_dt"]) and summary["max_crossing_rate_dt"] > 0.2:
+         warnings.append("event_resolution: max(crossing_rate*dt) > 0.2; consider smaller dt")
+-    if summary["frac_tau_local_capped_tail_median"] and math.isfinite(summary["frac_tau_local_capped_tail_median"]) and summary["frac_tau_local_capped_tail_median"] > 0.05:
+-        warnings.append("local_stress_cap_active_in_tail")
++    if summary["frac_tau_local_clipped_tail_median"] and math.isfinite(summary["frac_tau_local_clipped_tail_median"]) and summary["frac_tau_local_clipped_tail_median"] > 0.05:
++        warnings.append("local_stress_cap_clipping_active_in_tail")
++    if summary["frac_tau_local_over_cap_reference_tail_median"] and math.isfinite(summary["frac_tau_local_over_cap_reference_tail_median"]) and summary["frac_tau_local_over_cap_reference_tail_median"] > 0.05:
++        warnings.append("tau_local_exceeds_reference_cap_in_tail_diagnostic_only")
+     if summary["n_tau_decrease_steps"] == 0 and summary["total_depin"] > 0:
+         warnings.append("stress_never_decreased_despite_depin_events")
+     if summary["tau_post_peak_drop_MPa"] and math.isfinite(summary["tau_post_peak_drop_MPa"]) and summary["tau_post_peak_drop_MPa"] < 1e-6:
+@@ -578,6 +588,8 @@
+         "epsp_over_epstotal_final", "tau_tail_median_MPa", "tau_peak_MPa",
+         "tau_post_peak_drop_MPa", "total_depin", "n_live_pins_tail_median",
+         "tau_local_median_tail_MPa", "frac_tau_local_capped_tail_median",
++        "frac_tau_local_over_cap_reference_tail_median", "frac_tau_local_clipped_tail_median",
++        "tau_local_L_eff_tail_median_reduced", "tau_local_cap_mode", "tau_local_length_mode",
+         "max_crossing_rate_dt", "preflight_cross_Rfloor_dt",
+         "preflight_sweep_time_over_zero_force_lifetime",
+         "preflight_pin_survival_prob_one_spacing",
+@@ -708,7 +720,13 @@
+     ap.add_argument("--activation-length-reduced", type=float, default=0.0,
+                     help="fixed activation length in units of b; >0 overrides v*-derived ell_act.")
+     ap.add_argument("--tau-local-cap-MPa", type=float, default=8.0e3,
+-                    help="hard cap on tau_local (~theoretical strength) to prevent runaway.")
++                    help="diagnostic reference cap for tau_local. In v17 this is not used unless --tau-local-cap-mode clip/abort.")
++    ap.add_argument("--tau-local-cap-mode", choices=["none", "clip", "abort"], default="none",
++                    help="v17: none records uncapped tau_local; clip restores old diagnostic clipping; abort stops if tau_local exceeds --tau-local-cap-MPa.")
++    ap.add_argument("--tau-local-length-mode", choices=["feed", "capture_radius", "capture_diameter", "core", "manual", "activation"], default="feed",
++                    help="v17: effective length L_eff for converting point pin force to tau_local=F/(b L_eff). feed uses the same local feed length used for F_PK; capture modes use the obstacle interaction width; core/manual allow atomic-scale localization; activation restores old v*/b^2 mapping.")
++    ap.add_argument("--tau-local-L-eff-reduced", type=float, default=1.0,
++                    help="v17: manual/core minimum L_eff in units of b. For --tau-local-length-mode manual this is the full L_eff; otherwise it is a lower bound.")
+     ap.add_argument("--max-feed-length-reduced", type=float, default=-1.0,
+                     help="cap on F_PK feed length; <=0 uses forest spacing 1/sqrt(rho)/b.")
+ 
+@@ -959,7 +977,7 @@
+         "n_obstacles": nobs,
+         "fixed_cell_area_m2": (Lx * b) * (Lz * b),
+         "out_of_plane_spacing_m_used": s_out,
+-        "model": "clean_arrhenius_taylor_explicit_obstacles_v15_branch_floor_preflight",
++        "model": "clean_arrhenius_taylor_explicit_obstacles_v17_physical_Leff_uncapped_tau",
+         "v4_backstress_mobility": args.backstress_mobility,
+         "v4_max_back_stress_MPa": args.max_back_stress_MPa,
+         "v10_backstress_com_projection": args.backstress_com_projection,
+@@ -974,6 +992,10 @@
+         "v3_tau_ref_MPa": tau_ref_MPa,
+         "v3_activation_length_m": cross.activation_length_m(tau_ref_MPa, b, T),
+         "v3_tau_local_mode": args.tau_local_mode,
++        "v17_tau_local_cap_mode": args.tau_local_cap_mode,
++        "v17_tau_local_length_mode": args.tau_local_length_mode,
++        "v17_tau_local_L_eff_reduced": args.tau_local_L_eff_reduced,
++        "v17_tau_local_cap_is_diagnostic_only": args.tau_local_cap_mode == "none",
+         "v11_crossing_drive_mode": args.crossing_drive_mode,
+         "v11_cross_force_scale_mode": args.cross_force_scale_mode,
+         "v11_cross_force_scale_factor": args.cross_force_scale_factor,
+@@ -1036,7 +1058,9 @@
+         "crossing_drive_mode", "cross_force_scale_N", "cross_work_scale_eV",
+         "cross_drive_work_eV", "cross_force_ratio",
+         "n_live_pins", "tau_local_median_MPa", "tau_local_p90_MPa", "tau_local_max_MPa",
+-        "tau_local_uncapped_max_MPa", "frac_tau_local_capped",
++        "tau_local_uncapped_median_MPa", "tau_local_uncapped_max_MPa",
++        "frac_tau_local_capped", "frac_tau_local_over_cap_reference", "frac_tau_local_clipped",
++        "tau_local_L_eff_median_reduced", "tau_local_length_mode",
+         "phi_median", "phi_p90", "phi_max", "F_line_tension_median_N",
+         "crossing_rate_max_s", "crossing_expected_events_step",
+         "n_capture", "n_depin", "n_candidate_tests",
+@@ -1050,6 +1074,7 @@
+     event_cols = [
+         "step", "time_s", "line_id", "node_id", "obs_id", "event",
+         "x_node_reduced", "z_node_reduced", "tau_MPa", "tau_local_MPa",
++        "tau_local_uncapped_MPa", "tau_local_clipped", "tau_local_L_eff_reduced",
+         "rate_s", "barrier_eV", "work_eV", "prefactor",
+         "F_pin_N", "F_pk_N", "F_line_tension_N", "vstar_b3",
+         "crossing_drive_mode", "cross_force_scale_N", "cross_drive_work_eV", "cross_force_ratio",
+@@ -1057,7 +1082,7 @@
+     ]
+     pin_cols = [
+         "step", "time_s", "age_steps", "age_s", "line_id", "node_id", "obs_id",
+-        "tau_app_MPa", "tau_local_MPa", "phi_local",
++        "tau_app_MPa", "tau_local_MPa", "tau_local_uncapped_MPa", "tau_local_clipped", "tau_local_L_eff_reduced", "phi_local",
+         "F_pin_N", "F_pk_N", "F_line_tension_N",
+         "crossing_drive_mode", "cross_force_scale_N", "cross_drive_work_eV", "cross_force_ratio",
+         "pileup_contributors", "L_feed_reduced",
+@@ -1305,13 +1330,16 @@
+             # not just the last dictionary entry.
+             live_tau_local = []
+             live_tau_local_uncapped = []
++            live_tau_local_L_eff = []
++            live_tau_local_clipped = []
+             live_phi = []
+             live_F = []
+             live_Flt = []
+             live_vb3 = []
+             live_drive_work = []
+             live_force_ratio = []
+-            n_tau_capped = 0
++            n_tau_over_cap_reference = 0
++            n_tau_clipped = 0
+             phi_floor = max(args.phi_denominator_floor_MPa, 1.0e-300)
+ 
+             # Evaluate lead pinned junctions.
+@@ -1346,21 +1374,51 @@
+                         pile = min(pile, args.max_pileup_contributors)
+ 
+                 F_pin = abs(F_lt) + abs(F_pk) * pile
+-                # Diagnostic local-stress map retained for reporting/compatibility.
+-                # In v11 force_work mode this stress does NOT drive the crossing barrier;
+-                # it only shows what the old v10 mapping would have implied.
+-                tau_local_uncapped = float("nan")
+-                if args.tau_local_mode == "direct":
+-                    tau_local, ell_act, vstar = cross.tau_local_direct_MPa(
+-                        F_pin, b, tau_ref_MPa, T,
+-                        ell_fixed_red=args.activation_length_reduced,
+-                        tau_cap_MPa=args.tau_local_cap_MPa,
+-                    )
+-                    tau_local_uncapped = (F_pin / (b * max(ell_act, 1e-300))) / 1.0e6
+-                    stress_work_eV = tau_local * 1.0e6 * vstar / EV_J
++                # v17 physical local-stress map retained for diagnostics and for
++                # --crossing-drive-mode local_stress. In default force_work mode,
++                # tau_local does NOT drive the barrier. Define tau_local=F_pin/(b L_eff),
++                # where default L_eff=Lfeed, the same line length used for F_pk=tau*b*Lfeed.
++                # The cap is diagnostic only unless --tau-local-cap-mode clip/abort is requested.
++                tau_local_L_eff_red = float("nan")
++                tau_local_clipped = 0
++                vstar = cross.vstar_m3(tau_ref_MPa, T)
++                if args.tau_local_mode == "workrelation" or args.tau_local_length_mode == "activation":
++                    tau_local_raw, vstar_wr, stress_work_eV = cross.tau_from_force_MPa(F_pin, b, T)
++                    tau_local_uncapped = tau_local_raw
++                    vstar = vstar_wr
++                    tau_local_L_eff_red = float("nan")
+                 else:
+-                    tau_local, vstar, stress_work_eV = cross.tau_from_force_MPa(F_pin, b, T)
+-                    tau_local_uncapped = tau_local
++                    min_leff_red = max(float(args.tau_local_L_eff_reduced), 1.0e-12)
++                    if args.tau_local_length_mode == "feed":
++                        tau_local_L_eff_red = max(float(Lfeed), min_leff_red)
++                    elif args.tau_local_length_mode == "capture_radius":
++                        tau_local_L_eff_red = max(float(args.capture_radius_reduced), min_leff_red)
++                    elif args.tau_local_length_mode == "capture_diameter":
++                        tau_local_L_eff_red = max(2.0 * float(args.capture_radius_reduced), min_leff_red)
++                    elif args.tau_local_length_mode == "core":
++                        tau_local_L_eff_red = min_leff_red
++                    elif args.tau_local_length_mode == "manual":
++                        tau_local_L_eff_red = min_leff_red
++                    else:
++                        tau_local_L_eff_red = max(float(Lfeed), min_leff_red)
++                    ell_eff_m = tau_local_L_eff_red * b
++                    tau_local_uncapped = (max(F_pin, 0.0) / (b * max(ell_eff_m, 1.0e-300))) / 1.0e6
++                    stress_work_eV = tau_local_uncapped * 1.0e6 * vstar / EV_J
++
++                if tau_local_uncapped >= args.tau_local_cap_MPa - 1e-9:
++                    n_tau_over_cap_reference += 1
++                    if args.tau_local_cap_mode == "abort":
++                        raise RuntimeError(
++                            f"tau_local_uncapped={tau_local_uncapped:.6g} MPa exceeds diagnostic cap "
++                            f"{args.tau_local_cap_MPa:.6g} MPa at step={step}, line={li}, node={j}; "
++                            "use --tau-local-cap-mode none for uncapped diagnostics or fix force mapping."
++                        )
++                if args.tau_local_cap_mode == "clip" and tau_local_uncapped >= args.tau_local_cap_MPa:
++                    tau_local = float(args.tau_local_cap_MPa)
++                    tau_local_clipped = 1
++                    n_tau_clipped += 1
++                else:
++                    tau_local = tau_local_uncapped
+ 
+                 drive_work_eV = max(F_pin, 0.0) * b / EV_J
+                 force_ratio = max(F_pin, 0.0) / max(cross_force_scale_N, 1.0e-300)
+@@ -1377,15 +1435,16 @@
+                 # v5: phi against a floored |tau_app| so it does not blow up near zero stress
+                 phi = tau_local / max(abs(tau_MPa), phi_floor)
+                 vb3 = vstar / (b**3)
+-                if tau_local_uncapped >= args.tau_local_cap_MPa - 1e-9:
+-                    n_tau_capped += 1
+-
+                 if args.pin_diagnostic_every and args.pin_diagnostic_every > 0:
+                     if (step % args.pin_diagnostic_every == 0) and pin_rows_written < args.pin_diagnostic_max_rows:
+                         pw.writerow({
+                             "step": step, "time_s": time_s, "age_steps": age_steps, "age_s": age_steps * args.dt,
+                             "line_id": li, "node_id": j, "obs_id": oid,
+-                            "tau_app_MPa": tau_MPa, "tau_local_MPa": tau_local, "phi_local": phi,
++                            "tau_app_MPa": tau_MPa, "tau_local_MPa": tau_local,
++                            "tau_local_uncapped_MPa": tau_local_uncapped,
++                            "tau_local_clipped": tau_local_clipped,
++                            "tau_local_L_eff_reduced": tau_local_L_eff_red,
++                            "phi_local": phi,
+                             "F_pin_N": F_pin, "F_pk_N": F_pk, "F_line_tension_N": F_lt,
+                             "crossing_drive_mode": args.crossing_drive_mode,
+                             "cross_force_scale_N": cross_force_scale_N,
+@@ -1403,6 +1462,8 @@
+                 expected_cross += p_event
+                 live_tau_local.append(tau_local)
+                 live_tau_local_uncapped.append(tau_local_uncapped)
++                live_tau_local_L_eff.append(tau_local_L_eff_red)
++                live_tau_local_clipped.append(tau_local_clipped)
+                 live_phi.append(phi)
+                 live_F.append(F_pin)
+                 live_Flt.append(abs(F_lt))
+@@ -1432,6 +1493,9 @@
+                         "obs_id": oid, "event": "depin_cross",
+                         "x_node_reduced": x_lines[li, j], "z_node_reduced": z_lines[li, j],
+                         "tau_MPa": tau_MPa, "tau_local_MPa": tau_local,
++                        "tau_local_uncapped_MPa": tau_local_uncapped,
++                        "tau_local_clipped": tau_local_clipped,
++                        "tau_local_L_eff_reduced": tau_local_L_eff_red,
+                         "rate_s": rate_c, "barrier_eV": Gc, "work_eV": work_eV,
+                         "prefactor": 1.0, "F_pin_N": F_pin, "F_pk_N": F_pk,
+                         "F_line_tension_N": F_lt, "vstar_b3": vb3,
+@@ -1500,22 +1564,29 @@
+                 ltl = np.asarray(live_tau_local, dtype=float)
+                 lphi = np.asarray(live_phi, dtype=float)
+                 ltlu = np.asarray(live_tau_local_uncapped, dtype=float)
++                lleff = np.asarray(live_tau_local_L_eff, dtype=float)
+                 n_live = int(ltl.size)
+-                tl_med = float(np.median(ltl)); tl_p90 = float(np.quantile(ltl, 0.9)); tl_max = float(np.max(ltl))
+-                tlu_max = float(np.nanmax(ltlu))
+-                phi_med = float(np.median(lphi)); phi_p90 = float(np.quantile(lphi, 0.9)); phi_max = float(np.max(lphi))
+-                Flt_med = float(np.median(np.asarray(live_Flt, dtype=float)))
+-                F_med = float(np.median(np.asarray(live_F, dtype=float)))
+-                vb3_med = float(np.median(np.asarray(live_vb3, dtype=float)))
+-                wd_med = float(np.median(np.asarray(live_drive_work, dtype=float)))
+-                fr_med = float(np.median(np.asarray(live_force_ratio, dtype=float)))
+-                frac_capped = float(n_tau_capped) / float(n_live)
++                tl_med = float(np.nanmedian(ltl)); tl_p90 = float(np.nanquantile(ltl, 0.9)); tl_max = float(np.nanmax(ltl))
++                tlu_med = float(np.nanmedian(ltlu)); tlu_max = float(np.nanmax(ltlu))
++                leff_med = float(np.nanmedian(lleff)) if np.any(np.isfinite(lleff)) else float("nan")
++                phi_med = float(np.nanmedian(lphi)); phi_p90 = float(np.nanquantile(lphi, 0.9)); phi_max = float(np.nanmax(lphi))
++                Flt_med = float(np.nanmedian(np.asarray(live_Flt, dtype=float)))
++                F_med = float(np.nanmedian(np.asarray(live_F, dtype=float)))
++                vb3_med = float(np.nanmedian(np.asarray(live_vb3, dtype=float)))
++                wd_med = float(np.nanmedian(np.asarray(live_drive_work, dtype=float)))
++                fr_med = float(np.nanmedian(np.asarray(live_force_ratio, dtype=float)))
++                frac_over_cap_reference = float(n_tau_over_cap_reference) / float(n_live)
++                frac_clipped = float(n_tau_clipped) / float(n_live)
++                frac_capped = frac_clipped
+             else:
+                 n_live = 0
+-                tl_med = tl_p90 = tl_max = tlu_max = 0.0
++                tl_med = tl_p90 = tl_max = tlu_med = tlu_max = 0.0
++                leff_med = float("nan")
+                 phi_med = phi_p90 = phi_max = 0.0
+                 Flt_med = F_med = vb3_med = 0.0
+                 wd_med = fr_med = 0.0
++                frac_over_cap_reference = 0.0
++                frac_clipped = 0.0
+                 frac_capped = 0.0
+ 
+             tau_back_abs = np.abs(tau_back_MPa) if 'tau_back_MPa' in locals() else np.zeros_like(x_lines)
+@@ -1571,8 +1642,13 @@
+                 "tau_local_median_MPa": tl_med,
+                 "tau_local_p90_MPa": tl_p90,
+                 "tau_local_max_MPa": tl_max,
++                "tau_local_uncapped_median_MPa": tlu_med,
+                 "tau_local_uncapped_max_MPa": tlu_max,
+                 "frac_tau_local_capped": frac_capped,
++                "frac_tau_local_over_cap_reference": frac_over_cap_reference,
++                "frac_tau_local_clipped": frac_clipped,
++                "tau_local_L_eff_median_reduced": leff_med,
++                "tau_local_length_mode": args.tau_local_length_mode,
+                 "phi_median": phi_med,
+                 "phi_p90": phi_p90,
+                 "phi_max": phi_max,
