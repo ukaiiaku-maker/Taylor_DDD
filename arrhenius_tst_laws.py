@@ -2,10 +2,10 @@
 """Transition-state/Arrhenius kinetic laws for DDD mechanism audits.
 
 This module is intentionally independent of ParaDiS, ExaDiS, OpenDiS, and the
-reduced Taylor drivers.  It provides the common rate and barrier functions that
-should be used by every mechanism-specific adapter so that Peierls glide,
-forest depinning, junction reactions, cross slip, and source activation are all
-expressed through the same transition-state theory convention.
+reduced Taylor drivers. It provides common rate and barrier functions that can be
+used by mechanism-specific adapters so that Peierls glide, forest depinning,
+junction reactions, cross slip, and source activation are all expressed through
+one transition-state-theory convention.
 
 Stress convention
 -----------------
@@ -14,8 +14,21 @@ For force-work depinning this should be
 
     tau_eff = F_PK * x_dagger / v_star
 
-not the geometric diagnostic F_PK/(b L_eff).  This matches the convention used
-in the corrected continuous-contact Taylor front work.
+not the geometric diagnostic F_PK/(b L_eff).
+
+Entropy convention
+------------------
+The EXP-floor shape is applied to the enthalpic barrier H. The activation entropy
+is an additive transition-state contribution outside the stress/floor shape:
+
+    G(tau,T) = H * [f + (1-f) exp(-a (tau/sigma_c)^n)] - k_B T S_kB
+
+where S_kB is supplied in units of k_B. The high-drive floor is therefore
+
+    G_floor(T) = f H - k_B T S_kB
+
+not f * (H - k_B T S_kB). This matches the current reduced Taylor DDD convention
+and avoids making the high-drive floor artificially transparent at elevated T.
 """
 
 from __future__ import annotations
@@ -35,12 +48,16 @@ EV_J = 1.602176634e-19
 
 @dataclass(frozen=True)
 class ExpFloorBarrier:
-    """Exponential-floor activation barrier.
+    """Exponential-floor activation barrier with additive entropy.
 
-    G(tau, T) = G0(T) [ f + (1-f) exp{-a (tau/sigma_c)^n} ]
-    G0(T) = H - k_B T S, where S is supplied in units of k_B.
+    Enthalpy branch:
+        H_shape(tau) = H [ f + (1-f) exp{-a (tau/sigma_c)^n} ]
 
-    sigma_c is in Pa.  The input tau is also in Pa.
+    Free-energy barrier:
+        G(tau,T) = H_shape(tau) - k_B T S_kB
+
+    sigma_c and tau are in Pa. H and G are in eV. S_kB is dimensionless in units
+    of k_B.
     """
 
     H_eV: float
@@ -51,38 +68,52 @@ class ExpFloorBarrier:
     n: float
 
     def validate(self) -> None:
-        if self.sigma_c_Pa <= 0:
+        if self.H_eV <= 0.0:
+            raise ValueError("H_eV must be positive")
+        if self.sigma_c_Pa <= 0.0:
             raise ValueError("sigma_c_Pa must be positive")
         if not (0.0 <= self.f <= 1.0):
             raise ValueError("floor fraction f must be in [0, 1]")
         if self.a <= 0.0 or self.n <= 0.0:
             raise ValueError("EXP-floor shape parameters a and n must be positive")
 
-    def G0_eV(self, T_K: float) -> float:
+    def entropy_term_eV(self, T_K: float) -> float:
         if T_K <= 0:
             raise ValueError("T_K must be positive")
-        return self.H_eV - KB_EV_K * T_K * self.S_kB
+        return KB_EV_K * T_K * self.S_kB
+
+    def G0_eV(self, T_K: float) -> float:
+        """Zero-stress activation free energy."""
+        return self.H_eV - self.entropy_term_eV(T_K)
 
     def floor_eV(self, T_K: float) -> float:
-        return self.f * self.G0_eV(T_K)
+        """High-drive activation free-energy floor."""
+        return self.f * self.H_eV - self.entropy_term_eV(T_K)
 
-    def barrier_eV(self, tau_eff_Pa, T_K: float):
+    def enthalpy_shape_eV(self, tau_eff_Pa):
         self.validate()
         if np is None:
             tau = max(float(tau_eff_Pa), 0.0)
             x = tau / self.sigma_c_Pa
             shape = self.f + (1.0 - self.f) * math.exp(-self.a * (x ** self.n))
-            return max(self.G0_eV(T_K) * shape, self.floor_eV(T_K), 0.0)
+            return self.H_eV * shape
 
         tau = np.asarray(tau_eff_Pa, dtype=float)
         x = np.maximum(tau, 0.0) / self.sigma_c_Pa
         shape = self.f + (1.0 - self.f) * np.exp(-self.a * np.power(x, self.n))
-        return np.maximum(self.G0_eV(T_K) * shape, max(self.floor_eV(T_K), 0.0))
+        return self.H_eV * shape
+
+    def barrier_eV(self, tau_eff_Pa, T_K: float):
+        G = self.enthalpy_shape_eV(tau_eff_Pa) - self.entropy_term_eV(T_K)
+        floor = self.floor_eV(T_K)
+        if np is None:
+            return max(float(G), floor, 0.0)
+        return np.maximum(G, max(floor, 0.0))
 
     def inverse_tau_eff_Pa(self, G_req_eV: float, T_K: float) -> Tuple[float, str]:
         """Invert the EXP-floor branch.
 
-        Returns (tau_eff_Pa, regime).  Regime is one of:
+        Returns (tau_eff_Pa, regime). Regime is one of:
         - zero-stress-transparent: required barrier is at or above G0(T)
         - floor-limited: required barrier is below the residual floor
         - finite: finite stress solution exists
@@ -93,17 +124,58 @@ class ExpFloorBarrier:
             return 0.0, "zero-stress-transparent"
         if G_req_eV <= floor:
             return math.inf, "floor-limited"
-        y = (G_req_eV / G0 - self.f) / (1.0 - self.f)
+
+        # G_req = H * shape - k_B T S_kB, so shape = (G_req + k_B T S_kB)/H.
+        shape_req = (G_req_eV + self.entropy_term_eV(T_K)) / self.H_eV
+        y = (shape_req - self.f) / (1.0 - self.f)
         y = min(max(y, 1e-300), 1.0 - 1e-15)
         x = (-math.log(y) / self.a) ** (1.0 / self.n)
         return self.sigma_c_Pa * x, "finite"
 
 
 @dataclass(frozen=True)
-class ArrheniusHazard:
-    """Attempt frequency and temperature wrapper for an activation barrier."""
+class LinearWorkBarrier:
+    """Linear force-work/activation-volume barrier used for Peierls checks.
 
-    barrier: ExpFloorBarrier
+    This represents the current reduced Peierls convention more directly than an
+    EXP-floor Peierls fit:
+
+        G(tau,T) = max(floor_eV, H - tau v_star/eV_J) - k_B T S_kB
+
+    v_star is in m^3 and tau is in Pa.
+    """
+
+    H_eV: float
+    S_kB: float
+    v_star_m3: float
+    floor_fraction: float = 0.0
+
+    def validate(self) -> None:
+        if self.H_eV < 0.0:
+            raise ValueError("H_eV must be nonnegative")
+        if self.v_star_m3 <= 0.0:
+            raise ValueError("v_star_m3 must be positive")
+        if not (0.0 <= self.floor_fraction <= 1.0):
+            raise ValueError("floor_fraction must be in [0,1]")
+
+    def barrier_eV(self, tau_eff_Pa, T_K: float):
+        self.validate()
+        entropic = KB_EV_K * T_K * self.S_kB
+        if np is None:
+            work_eV = max(float(tau_eff_Pa), 0.0) * self.v_star_m3 / EV_J
+            enthalpy = max(self.floor_fraction * self.H_eV, self.H_eV - work_eV)
+            return max(0.0, enthalpy - entropic)
+        tau = np.asarray(tau_eff_Pa, dtype=float)
+        work_eV = np.maximum(tau, 0.0) * self.v_star_m3 / EV_J
+        enthalpy = np.maximum(self.floor_fraction * self.H_eV, self.H_eV - work_eV)
+        return np.maximum(0.0, enthalpy - entropic)
+
+
+@dataclass(frozen=True)
+class ArrheniusHazard:
+    """Attempt-frequency and temperature wrapper for an activation barrier."""
+
+    barrier: object
     eta0_s: float = 1.0e12
 
     def rate_s(self, tau_eff_Pa, T_K: float):
@@ -131,7 +203,7 @@ def signed_forward_minus_reverse_rate_s(
     law: ArrheniusHazard,
     T_K: float,
 ) -> float:
-    """Signed Peierls-style forward-minus-reverse rate."""
+    """Signed forward-minus-reverse rate used for Peierls-style glide."""
     return float(law.rate_s(max(tau_eff_Pa, 0.0), T_K) - law.rate_s(max(-tau_eff_Pa, 0.0), T_K))
 
 
@@ -143,11 +215,7 @@ def required_barrier_for_taylor_flow_eV(
     b_m: float,
     prefactor: float = 16.0,
 ) -> float:
-    """Analytical residual barrier required by the ideal Arrhenius-Taylor closure.
-
-    This is the same barrier level used to compare an ideal independent-site
-    Taylor branch with explicit-contact DDD runs.
-    """
+    """Analytical residual barrier required by the ideal Arrhenius-Taylor closure."""
     arg = eta0_s * prefactor * rho_m2**2 * b_m**4 / strain_rate_s
     if arg <= 0.0:
         raise ValueError("Taylor flow argument must be positive")
@@ -170,6 +238,8 @@ def analytical_taylor_exp_floor_stress_MPa(
 
     Returns (tau_app_MPa, regime, G_req_eV, tau_eff_GPa).
     """
+    if not isinstance(law.barrier, ExpFloorBarrier):
+        raise TypeError("analytical_taylor_exp_floor_stress_MPa requires ExpFloorBarrier")
     G_req = required_barrier_for_taylor_flow_eV(
         rho_m2=rho_m2,
         T_K=T_K,
