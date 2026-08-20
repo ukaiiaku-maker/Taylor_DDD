@@ -2,25 +2,32 @@
 
 // Native Arrhenius/TST hook interface scaffold for ExaDiS/ParaDiS integration.
 //
-// This header is deliberately self-contained.  It does not include ExaDiS
+// This header is deliberately self-contained. It does not include ExaDiS
 // internal headers yet because the Taylor_DDD repository is an adapter/testing
-// repository rather than a vendored ExaDiS source tree.  The purpose is to fix
+// repository rather than a vendored ExaDiS source tree. The purpose is to fix
 // the physics interface and audit outputs before these classes are moved into
-// the native ExaDiS mobility, topology, cross-slip, and collision modules.
+// native ExaDiS mobility, topology, cross-slip, and collision modules.
 //
 // Non-negotiable convention:
 //   activated mechanisms are represented by hazards
 //       R = eta0 exp[-G(tau_eff,T)/(kB T)]
 //       P(dt) = 1 - exp[-R dt]
-//   and the stress argument is the event-conjugate local stress.  If the event
+//   and the stress argument is the event-conjugate local stress. If the event
 //   is naturally force-work based, use
 //       tau_eff = F_event * x_dagger / v_star
 //   and do not use a diagnostic average stress as the kinetic input.
+//
+// Entropy/floor convention:
+//   The EXP-floor shape is applied to enthalpy H only. Entropy is an additive
+//   TST term outside the shape:
+//       G = H [f + (1-f) exp(-a(tau/sigma_c)^n)] - kB T S_kB
+//   Thus G_floor = f H - kB T S_kB, not f(H - kB T S_kB).
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +46,7 @@ struct ExpFloorBarrierParams {
     double eta0_s = 1.0e12;
 
     void validate() const {
+        if (H_eV <= 0.0) throw std::runtime_error("H_eV must be positive");
         if (sigma_c_Pa <= 0.0) throw std::runtime_error("sigma_c_Pa must be positive");
         if (floor_fraction < 0.0 || floor_fraction > 1.0) throw std::runtime_error("floor_fraction must be in [0,1]");
         if (a <= 0.0 || n <= 0.0) throw std::runtime_error("EXP-floor shape parameters must be positive");
@@ -46,17 +54,29 @@ struct ExpFloorBarrierParams {
     }
 };
 
+inline double entropy_term_eV(const ExpFloorBarrierParams& p, double T_K) {
+    if (T_K <= 0.0) throw std::runtime_error("T_K must be positive");
+    return kB_eV_per_K * T_K * p.S_kB;
+}
+
 inline double G0_eV(const ExpFloorBarrierParams& p, double T_K) {
-    return p.H_eV - kB_eV_per_K * T_K * p.S_kB;
+    return p.H_eV - entropy_term_eV(p, T_K);
+}
+
+inline double floor_eV(const ExpFloorBarrierParams& p, double T_K) {
+    return p.floor_fraction * p.H_eV - entropy_term_eV(p, T_K);
+}
+
+inline double exp_floor_enthalpy_eV(const ExpFloorBarrierParams& p, double tau_eff_Pa) {
+    p.validate();
+    const double x = std::max(tau_eff_Pa, 0.0) / p.sigma_c_Pa;
+    const double shape = p.floor_fraction + (1.0 - p.floor_fraction) * std::exp(-p.a * std::pow(x, p.n));
+    return p.H_eV * shape;
 }
 
 inline double exp_floor_barrier_eV(const ExpFloorBarrierParams& p, double tau_eff_Pa, double T_K) {
-    p.validate();
-    const double G0 = G0_eV(p, T_K);
-    const double floor = p.floor_fraction * G0;
-    const double x = std::max(tau_eff_Pa, 0.0) / p.sigma_c_Pa;
-    const double shape = p.floor_fraction + (1.0 - p.floor_fraction) * std::exp(-p.a * std::pow(x, p.n));
-    return std::max({0.0, floor, G0 * shape});
+    const double G = exp_floor_enthalpy_eV(p, tau_eff_Pa) - entropy_term_eV(p, T_K);
+    return std::max({0.0, floor_eV(p, T_K), G});
 }
 
 inline double arrhenius_rate_s(const ExpFloorBarrierParams& p, double tau_eff_Pa, double T_K) {
@@ -105,12 +125,6 @@ struct MechanismAuditRecord {
     std::string note;
 };
 
-// ArrheniusMobilityLaw
-// --------------------
-// Native target for replacing segment glide mobility with a signed
-// forward-minus-reverse Peierls hazard.  The ExaDiS mobility law should call
-// signed_velocity_increment() using the resolved glide stress.  It should not
-// inject a deterministic Peierls threshold.
 class ArrheniusMobilityLaw {
 public:
     explicit ArrheniusMobilityLaw(ExpFloorBarrierParams peierls_params, double glide_jump_m)
@@ -133,7 +147,7 @@ public:
         r.tau_eff_Pa = tau_resolved_Pa;
         r.barrier_eV = exp_floor_barrier_eV(peierls_params_, std::abs(tau_resolved_Pa), T_K);
         r.rate_s = std::abs(signed_rate_s(tau_resolved_Pa, T_K));
-        r.probability_dt = std::clamp(r.rate_s * dt_s, 0.0, 50.0);
+        r.probability_dt = event_probability(peierls_params_, std::abs(tau_resolved_Pa), T_K, dt_s);
         return r;
     }
 
@@ -142,11 +156,6 @@ private:
     double glide_jump_m_ = 0.0;
 };
 
-// ArrheniusTopology
-// -----------------
-// Native target for topology operations that are currently deterministic once
-// geometry/force criteria are met.  Geometry should generate candidates;
-// kinetics must be hazard based.
 class ArrheniusTopology {
 public:
     ArrheniusTopology(ExpFloorBarrierParams depinning_params,
@@ -164,6 +173,7 @@ public:
 
     double junction_reaction_probability(double delta_work_J, double v_star_m3,
                                          double T_K, double dt_s, bool unzip) const {
+        if (v_star_m3 <= 0.0) throw std::runtime_error("v_star_m3 must be positive");
         const double tau_eff = std::max(delta_work_J, 0.0) / v_star_m3;
         return event_probability(unzip ? junction_unzip_params_ : junction_zip_params_, tau_eff, T_K, dt_s);
     }
@@ -174,11 +184,6 @@ private:
     ExpFloorBarrierParams junction_unzip_params_;
 };
 
-// ArrheniusCrossSlip
-// ------------------
-// Native target for force-based cross slip.  Candidate planes remain generated
-// by ExaDiS crystallography.  Selection is a competing hazard using the local
-// driving difference between primary and cross-slip planes.
 class ArrheniusCrossSlip {
 public:
     explicit ArrheniusCrossSlip(ExpFloorBarrierParams cross_slip_params)
@@ -193,11 +198,6 @@ private:
     ExpFloorBarrierParams cross_slip_params_;
 };
 
-// ArrheniusCollision
-// ------------------
-// Native target for collisions only when the reaction is activated.  Pure core
-// overlap or numerical collision cleanup should remain deterministic and should
-// be audited as deterministic_geometry_only.
 class ArrheniusCollision {
 public:
     explicit ArrheniusCollision(ExpFloorBarrierParams activated_collision_params)
