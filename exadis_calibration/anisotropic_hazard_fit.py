@@ -210,6 +210,37 @@ def exp_floor_rate_s(tau_eff_Pa: np.ndarray, T_K: float, p: ExpFloorParams) -> n
     return p.eta0_s * np.exp(-G / (KB_EV_K * T_K))
 
 
+def exp_floor_signed_velocity_m_s(
+    tau_signed_Pa: np.ndarray,
+    temperature_K: np.ndarray | float,
+    p: ExpFloorParams,
+    jump_b: float,
+    b_m: float,
+) -> np.ndarray:
+    """Directional forward-minus-reverse EXP-floor Peierls velocity."""
+    tau = np.asarray(tau_signed_Pa, dtype=float)
+    temperature = np.asarray(temperature_K, dtype=float)
+    gp = exp_floor_free_energy_eV_array(np.maximum(tau, 0.0), temperature, p)
+    gm = exp_floor_free_energy_eV_array(np.maximum(-tau, 0.0), temperature, p)
+    rp = p.eta0_s * np.exp(-gp / (KB_EV_K * temperature))
+    rm = p.eta0_s * np.exp(-gm / (KB_EV_K * temperature))
+    return jump_b * b_m * (rp - rm)
+
+
+def exp_floor_free_energy_eV_array(
+    tau_eff_Pa: np.ndarray, temperature_K: np.ndarray | float, p: ExpFloorParams
+) -> np.ndarray:
+    tau = np.maximum(np.asarray(tau_eff_Pa, dtype=float), 0.0)
+    temperature = np.asarray(temperature_K, dtype=float)
+    x = tau / (p.sigma_c_GPa * 1.0e9)
+    enthalpy = p.H_eV * (
+        p.f + (1.0 - p.f) * np.exp(-p.a * np.power(x, p.n))
+    )
+    g = enthalpy - KB_EV_K * temperature * p.S_kB
+    floor = p.f * p.H_eV - KB_EV_K * temperature * p.S_kB
+    return np.maximum(g, np.maximum(floor, 0.0))
+
+
 def linear_work_barrier_eV(tau_eff_Pa: np.ndarray, T_K: float, p: LinearPeierlsParams, b_m: float) -> np.ndarray:
     tau = np.maximum(np.asarray(tau_eff_Pa, dtype=float), 0.0)
     vstar = p.vstar_b3 * b_m**3
@@ -285,123 +316,259 @@ def _truthy_mask(series: pd.Series) -> np.ndarray:
     return (numeric == 1.0) | text
 
 
-def fit_mobility_equivalence(df: pd.DataFrame, T_K: float, b_m: float, outdir: Path) -> dict:
-    mask = _mechanism_mask(df, ["mobility", "mobility_force", "fcc0"])
-    m = df[mask].copy()
-    if m.empty:
-        return {"status": "no_data", "mechanism": "mobility"}
+def _mobility_node_targets(m: pd.DataFrame, fallback_T_K: float, b_m: float) -> pd.DataFrame:
+    """Collapse arm rows to the actual event-conjugate nodal degree of freedom.
 
-    vel_col = _find_first_column(m, [
-        "velocity_glide_m_s",
-        "glide_velocity_m_s",
-        "v_glide_m_s",
-        "velocity_m_s",
-        "node_velocity_projected_m_s",
-        "speed_m_s",
-    ])
-    if vel_col is None:
-        # Fallback: infer speed from vector components if present.
-        vx = _find_first_column(m, ["node_velocity_x_m_s", "velocity_x_m_s", "v_x"])
-        vy = _find_first_column(m, ["node_velocity_y_m_s", "velocity_y_m_s", "v_y"])
-        vz = _find_first_column(m, ["node_velocity_z_m_s", "velocity_z_m_s", "v_z"])
-        if vx and vy and vz:
-            y = np.linalg.norm(np.column_stack([_as_float_array(m[vx]), _as_float_array(m[vy]), _as_float_array(m[vz])]), axis=1)
-        else:
-            return {"status": "no_velocity_column", "mechanism": "mobility", "rows": int(len(m))}
+    FCC_0 solves one constrained nodal velocity from one projected nodal force.
+    Treating each arm projection as an independent signed event produced the old
+    91.5% sign ceiling.  The nodal generalized force is reconstructed from
+    power/velocity and divided by half the attached line length, exactly matching
+    the stress definition used by the native Arrhenius mobility.
+    """
+    velocity = _vector_column(m, "velocity_m_s", 3)
+    if velocity is None or "node_id" not in m or "step" not in m:
+        return pd.DataFrame()
+    work = m.copy()
+    work["_vx"] = velocity[:, 0]
+    work["_vy"] = velocity[:, 1]
+    work["_vz"] = velocity[:, 2]
+    group_columns = ["step", "node_id"]
+    for optional in (
+        "condition_id", "state_id", "initial_state_id", "strain_rate_s",
+        "temperature_K",
+    ):
+        if optional in work.columns:
+            group_columns.append(optional)
+
+    work["_L_m"] = pd.to_numeric(work["L_m"], errors="coerce")
+    work["_dt_s"] = pd.to_numeric(
+        work["dt_s"] if "dt_s" in work else 1e-9, errors="coerce"
+    )
+    if "after_power_W" in work:
+        work["_power_W"] = pd.to_numeric(work["after_power_W"], errors="coerce")
     else:
-        y = _as_float_array(m[vel_col])
-
-    base_coupling = AnisotropicCoupling()
-    tau0 = effective_stress_from_audit(m, base_coupling)
-    finite = np.isfinite(y) & np.isfinite(tau0) & (np.abs(y) > 0.0) & (np.abs(tau0) > 0.0)
-    y = y[finite]
-    tau0 = tau0[finite]
-    mfit = m.iloc[np.where(finite)[0]].copy()
-    if len(y) < 8:
-        return {"status": "too_few_rows", "mechanism": "mobility", "rows": int(len(y))}
-
-    derived = tensor_components_from_audit(mfit)
-    has_nn = _find_first_column(mfit, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"]) is not None or "sigma_nn_Pa" in derived
-    has_mm = _find_first_column(mfit, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"]) is not None or "sigma_mm_Pa" in derived
-    has_np = _find_first_column(mfit, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"]) is not None or "sigma_np_Pa" in derived
-
-    def objective(x):
-        # x = [log10_eta0, log10_vstar_b3, jump_b, a_nn, a_mm, a_np]
-        p = LinearPeierlsParams(
-            H_eV=0.05,
-            S_kB=0.0,
-            vstar_b3=10.0 ** x[1],
-            eta0_s=10.0 ** x[0],
-            jump_b=max(x[2], 1e-6),
+        force = _vector_column(work, "force_N", 3)
+        if force is None:
+            return pd.DataFrame()
+        work["_power_W"] = (
+            force[:, 0] * work["_vx"].to_numpy(float)
+            + force[:, 1] * work["_vy"].to_numpy(float)
+            + force[:, 2] * work["_vz"].to_numpy(float)
         )
-        coupling = AnisotropicCoupling(
-            a_nn=x[3] if has_nn else 0.0,
-            a_mm=x[4] if has_mm else 0.0,
-            a_np=x[5] if has_np else 0.0,
-            abs_effective_stress=False,
-        )
-        tau = effective_stress_from_audit(mfit, coupling)
-        pred = linear_signed_velocity_m_s(tau, T_K, p, b_m)
-        # Fit logarithmic magnitude and sign consistency.
-        eps = 1e-30
-        err_mag = np.log10(np.abs(pred) + eps) - np.log10(np.abs(y) + eps)
-        sign_penalty = 2.0 * (np.sign(pred) != np.sign(y)).astype(float)
-        return float(np.nanmean(err_mag**2 + sign_penalty))
 
-    x0 = np.array([12.0, 1.0, 1.0, 0.0, 0.0, 0.0])
-    bounds = [(8.0, 14.5), (-1.0, 3.0), (1e-3, 20.0), (-2.0, 2.0), (-2.0, 2.0), (-2.0, 2.0)]
-    if minimize is None:
-        xbest, loss = x0, objective(x0)
+    # This aggregation is algebraically identical to the former per-group
+    # loop, but keeps multi-state native campaigns out of Python object/swap
+    # overhead.  Velocity, power, and dt are nodal values repeated on arm rows;
+    # attached arm lengths are the only quantity summed.
+    grouped = work.groupby(group_columns, sort=False, dropna=False, as_index=False).agg(
+        _vx=("_vx", "first"),
+        _vy=("_vy", "first"),
+        _vz=("_vz", "first"),
+        _power_W=("_power_W", "first"),
+        _dt_s=("_dt_s", "first"),
+        _total_length_m=("_L_m", "sum"),
+    )
+    speed = np.sqrt(grouped["_vx"] ** 2 + grouped["_vy"] ** 2 + grouped["_vz"] ** 2)
+    half_length = 0.5 * grouped["_total_length_m"].to_numpy(float)
+    power = grouped["_power_W"].to_numpy(float)
+    dt = grouped["_dt_s"].to_numpy(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tau = np.abs(power) / speed.to_numpy(float) / (b_m * half_length)
+    valid = (
+        np.isfinite(speed.to_numpy(float)) & (speed.to_numpy(float) > 0.0)
+        & np.isfinite(half_length) & (half_length > 0.0)
+        & np.isfinite(power) & (power != 0.0)
+        & np.isfinite(tau) & (tau > 0.0)
+    )
+    nodes = grouped.loc[valid, group_columns].copy()
+    sign = np.sign(power[valid])
+    nodes["temperature_K"] = (
+        pd.to_numeric(nodes["temperature_K"], errors="coerce")
+        if "temperature_K" in nodes else fallback_T_K
+    )
+    nodes["dt_s"] = np.where(dt[valid] > 0.0, dt[valid], 1e-9)
+    nodes["tau_event_Pa"] = sign * tau[valid]
+    nodes["velocity_event_m_s"] = sign * speed.to_numpy(float)[valid]
+    return nodes
+
+
+def fit_mobility_equivalence(
+    df: pd.DataFrame, T_K: float, b_m: float, outdir: Path,
+    adaptive_event_integration: bool = False,
+) -> dict:
+    if {"tau_event_Pa", "velocity_event_m_s"}.issubset(df.columns):
+        m = df
+        nodes = df.copy()
+        arm_row_count = int(df.get("source_arm_rows", pd.Series([len(df)])).sum())
+    else:
+        mask = _mechanism_mask(df, ["mobility_fcc0"])
+        m = df[mask].copy()
+        if m.empty:
+            return {"status": "no_data", "mechanism": "mobility"}
+        nodes = _mobility_node_targets(m, T_K, b_m)
+        arm_row_count = int(len(m))
+    if len(nodes) < 20:
+        return {"status": "too_few_nodal_rows", "mechanism": "mobility", "rows": int(len(nodes))}
+
+    tau = nodes["tau_event_Pa"].to_numpy(float)
+    velocity = nodes["velocity_event_m_s"].to_numpy(float)
+    temperature = nodes["temperature_K"].to_numpy(float)
+    dt = nodes["dt_s"].to_numpy(float)
+    condition_count = int(nodes.get("condition_id", pd.Series(["single"])).nunique())
+    temperature_count = int(np.unique(temperature).size)
+    state_count = int(nodes.get("state_id", pd.Series(["single"])).nunique())
+    initial_state_count = int(
+        nodes.get("initial_state_id", pd.Series(["single"])).nunique()
+    )
+
+    if "initial_state_id" in nodes and initial_state_count > 1:
+        # Keep an entire originating network out of the optimizer.  All of its
+        # nodes, rates, evolved snapshots, and temperature evaluations remain
+        # held out, avoiding row-level or duplicate-temperature leakage.
+        held_state = sorted(nodes["initial_state_id"].astype(str).unique())[-1]
+        held = (nodes["initial_state_id"].astype(str) == held_state).to_numpy()
+    elif "state_id" in nodes and state_count > 1:
+        held = nodes["state_id"].astype(str).map(
+            lambda value: sum(value.encode("utf-8")) % 5 == 0
+        ).to_numpy()
+    else:
+        held = ((nodes["node_id"].to_numpy(int) * 37 + nodes["step"].to_numpy(int)) % 5) == 0
+    if held.sum() < 5 or (~held).sum() < 10:
+        held = np.arange(len(nodes)) % 5 == 0
+    train = ~held
+    optimize = train.copy()
+    train_indices = np.flatnonzero(train)
+    if len(train_indices) > 50_000:
+        rng = np.random.default_rng(1701)
+        keep = rng.choice(train_indices, size=50_000, replace=False)
+        optimize[:] = False
+        optimize[keep] = True
+
+    bounds = [
+        (0.005, 1.5),      # H_eV
+        (-4.0, 10.0),      # S_kB
+        (-3.0, 1.3),       # log10 sigma_c_GPa
+        (0.002, 0.95),     # floor fraction
+        (0.05, 60.0),      # shape a
+        (0.35, 4.0),       # shape n
+        (-2.0, math.log10(50.0)),  # log10 jump_b
+    ]
+
+    def unpack(x: np.ndarray) -> tuple[ExpFloorParams, float]:
+        return ExpFloorParams(
+            H_eV=float(x[0]), S_kB=float(x[1]), sigma_c_GPa=10.0 ** float(x[2]),
+            f=float(x[3]), a=float(x[4]), n=float(x[5]), eta0_s=1.0e12,
+        ), 10.0 ** float(x[6])
+
+    def objective(x: np.ndarray, selected: np.ndarray = optimize) -> float:
+        p, jump = unpack(x)
+        pred = exp_floor_signed_velocity_m_s(tau[selected], temperature[selected], p, jump, b_m)
+        error = np.log10(np.abs(pred) + 1e-30) - np.log10(np.abs(velocity[selected]) + 1e-30)
+        sign_penalty = 4.0 * (np.sign(pred) != np.sign(velocity[selected]))
+        return float(np.mean(error * error + sign_penalty))
+
+    x0 = np.array([0.08, 1.0, -0.3, 0.08, 4.0, 1.0, 0.5])
+    if differential_evolution is not None:
+        result_global = differential_evolution(
+            objective, bounds=bounds, maxiter=24, popsize=7, polish=False,
+            seed=1701, workers=1,
+        )
+        start = result_global.x
+        method = "differential_evolution+L-BFGS-B"
+    else:
+        start = x0
         method = "initial_only_no_scipy"
+    if minimize is not None:
+        result = minimize(objective, start, bounds=bounds, method="L-BFGS-B",
+                          options={"maxiter": 3000, "ftol": 1e-12})
+        xbest = result.x
     else:
-        res = minimize(objective, x0, bounds=bounds, method="Nelder-Mead", options={"maxiter": 2000})
-        xbest = res.x
-        loss = objective(xbest)
-        method = "scipy_minimize"
-
-    pbest = LinearPeierlsParams(
-        H_eV=0.05,
-        S_kB=0.0,
-        vstar_b3=10.0 ** xbest[1],
-        eta0_s=10.0 ** xbest[0],
-        jump_b=max(xbest[2], 1e-6),
+        xbest = start
+    pbest, jump_best = unpack(xbest)
+    implied_vstar_m3 = (
+        pbest.H_eV * (1.0 - pbest.f) * pbest.a * pbest.n /
+        (pbest.sigma_c_GPa * 1.0e9) * EV_J
     )
-    cbest = AnisotropicCoupling(
-        a_nn=xbest[3] if has_nn else 0.0,
-        a_mm=xbest[4] if has_mm else 0.0,
-        a_np=xbest[5] if has_np else 0.0,
-    )
-    tau_best = effective_stress_from_audit(mfit, cbest)
-    pred_best = linear_signed_velocity_m_s(tau_best, T_K, pbest, b_m)
+    implied_vstar_b3 = implied_vstar_m3 / (b_m ** 3)
+    prediction = exp_floor_signed_velocity_m_s(tau, temperature, pbest, jump_best, b_m)
 
-    table = pd.DataFrame({
-        "native_velocity_m_s": y,
-        "fit_velocity_m_s": pred_best,
-        "tau_eff_fit_Pa": tau_best,
-        "tau_eff_base_Pa": tau0,
-    })
+    def metrics(selected: np.ndarray) -> dict:
+        observed = velocity[selected]
+        predicted = prediction[selected]
+        log_error = np.log10(np.abs(predicted) + 1e-30) - np.log10(np.abs(observed) + 1e-30)
+        ratio = np.abs(predicted) / np.maximum(np.abs(observed), 1e-30)
+        return {
+            "rows": int(selected.sum()),
+            "rmse_log10_abs_velocity": float(np.sqrt(np.mean(log_error**2))),
+            "sign_accuracy": float(np.mean(np.sign(predicted) == np.sign(observed))),
+            "median_velocity_ratio": float(np.median(ratio)),
+        }
+
+    train_metrics = metrics(train)
+    held_metrics = metrics(held)
+    gp = exp_floor_free_energy_eV_array(np.maximum(tau, 0.0), temperature, pbest)
+    gm = exp_floor_free_energy_eV_array(np.maximum(-tau, 0.0), temperature, pbest)
+    rate_max = np.maximum(
+        pbest.eta0_s * np.exp(-gp / (KB_EV_K * temperature)),
+        pbest.eta0_s * np.exp(-gm / (KB_EV_K * temperature)),
+    )
+    rdt = rate_max * dt
+    at_bounds = []
+    parameter_names = ["H_eV", "S_kB", "log10_sigma_c_GPa", "f", "a", "n", "log10_jump_b"]
+    for name, value, (lower, upper) in zip(parameter_names, xbest, bounds):
+        span = upper - lower
+        if min(value - lower, upper - value) <= 0.005 * span:
+            at_bounds.append(name)
+
+    multi_condition = temperature_count >= 3 and state_count >= 2 and condition_count >= 8
+    gates = {
+        "training_rmse_lt_0p5": train_metrics["rmse_log10_abs_velocity"] < 0.5,
+        "heldout_rmse_lt_0p75": held_metrics["rmse_log10_abs_velocity"] < 0.75,
+        "sign_accuracy_gt_0p97": held_metrics["sign_accuracy"] > 0.97,
+        "median_ratio_0p5_to_2": 0.5 <= held_metrics["median_velocity_ratio"] <= 2.0,
+        "rdt_stable_or_adaptive": (
+            float(np.percentile(rdt, 95.0)) < 0.2 or adaptive_event_integration
+        ),
+        "no_parameter_on_bound": not at_bounds,
+        "multi_temperature_state_campaign": multi_condition,
+        "multiple_initial_network_states": initial_state_count >= 2,
+    }
+    replacement_eligible = all(gates.values())
+    blockers = [name for name, passed in gates.items() if not passed]
+
+    table = nodes.copy()
+    table["fit_velocity_m_s"] = prediction
+    table["held_out"] = held
+    table["Rdt_max_direction"] = rdt
     table.to_csv(outdir / "mobility_fit_observed_vs_predicted.csv", index=False)
-
     return {
         "status": "fit",
-        "replacement_eligible": False,
-        "replacement_blockers": [
-            "single-temperature audit cannot identify activation enthalpy and entropy separately",
-            "FCC_0 arm projection is a calibrated surrogate of shared nodal mobility, not an event-conjugate barrier",
-            "site multiplicity and event strain increment are not identified by this audit",
-        ],
+        "replacement_eligible": replacement_eligible,
+        "replacement_blockers": blockers,
         "mechanism": "mobility",
-        "rows": int(len(y)),
+        "arm_rows": arm_row_count,
+        "nodal_rows": int(len(nodes)),
+        "optimization_rows": int(optimize.sum()),
         "method": method,
-        "loss": loss,
-        "temperature_K": T_K,
+        "temperature_count": temperature_count,
+        "state_count": state_count,
+        "initial_state_count": initial_state_count,
+        "condition_count": condition_count,
         "burgers_m": b_m,
-        "peierls_linear_work_params": asdict(pbest),
-        "anisotropic_coupling": asdict(cbest),
-        "rmse_log10_abs_velocity": float(np.sqrt(np.nanmean((np.log10(np.abs(pred_best)+1e-30)-np.log10(np.abs(y)+1e-30))**2))),
-        "sign_accuracy": float(np.mean(np.sign(pred_best) == np.sign(y))),
-        "native_velocity_median_abs_m_s": float(np.nanmedian(np.abs(y))),
-        "fit_velocity_median_abs_m_s": float(np.nanmedian(np.abs(pred_best))),
+        "eta0_fixed_s": 1.0e12,
+        "exp_floor_params": asdict(pbest),
+        "jump_b": jump_best,
+        "vstar_characteristic_b3": implied_vstar_b3,
+        "vstar_definition": "H*(1-f)*a*n/sigma_c characteristic phi*V* scale; local -dG/dtau also carries x^(n-1)*exp(-a*x^n)",
+        "anisotropic_coupling": asdict(AnisotropicCoupling()),
+        "training": train_metrics,
+        "held_out": held_metrics,
+        "Rdt_median": float(np.median(rdt)),
+        "Rdt_p95": float(np.percentile(rdt, 95.0)),
+        "adaptive_event_integration": adaptive_event_integration,
+        "parameters_on_bounds": at_bounds,
+        "gates": gates,
+        "stress_definition": "abs(projected_nodal_power)/speed/(b*half_attached_line_length)",
     }
 
 
@@ -595,6 +762,7 @@ def main() -> int:
     ap.add_argument("--stress-strain-dens", type=Path, default=None)
     ap.add_argument("--no-cross-slip", action="store_true")
     ap.add_argument("--no-collision", action="store_true")
+    ap.add_argument("--adaptive-event-integration", action="store_true")
     args = ap.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -611,7 +779,7 @@ def main() -> int:
         "notes": [
             "These are calibrated mechanism surrogates, not universal barrier constants.",
             "No fit is eligible for native replacement until H, S, effective activation volume phi*V*, site multiplicity, and event strain increment are identified and validated out of sample.",
-            "Mobility fit uses signed linear-work Peierls kinetics to match FCC_0 velocities.",
+            "Mobility fit uses directional forward-minus-reverse EXP-floor Peierls kinetics at fixed eta0=1e12 s^-1.",
             "Cross-slip and collision fits use binary stock acceptance labels when available.",
             "Independent pathways combine by summing hazards; sequential obstacles require renewal/residence-time treatment and must not be collapsed into a hazard sum.",
         ],
@@ -620,7 +788,10 @@ def main() -> int:
     if df.empty:
         summary["fits"].append({"status": "no_data", "mechanism": "all"})
     else:
-        summary["fits"].append(fit_mobility_equivalence(df, args.temperature_K, args.burgers_m, args.outdir))
+        summary["fits"].append(fit_mobility_equivalence(
+            df, args.temperature_K, args.burgers_m, args.outdir,
+            adaptive_event_integration=args.adaptive_event_integration,
+        ))
         if not args.no_cross_slip:
             summary["fits"].append(fit_binary_hazard(df, args.temperature_K, args.outdir, "cross_slip", ["cross_slip", "cross-slip", "xslip"]))
         if not args.no_collision:

@@ -1,5 +1,8 @@
 # Native ExaDiS audit report
 
+> Historical A0 instrumentation report. The connected A1 implementation and
+> current gate decisions are in `EXADIS_NATIVE_ARRHENIUS_STAGE_REPORT.md`.
+
 ## Provenance
 
 ```text

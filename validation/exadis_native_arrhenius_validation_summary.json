@@ -1,0 +1,105 @@
+{
+  "arrhenius_replacements_connected": true,
+  "complete_all_mechanism_model": false,
+  "delivery_label": "native ExaDiS A1 Arrhenius Peierls mobility; topology and cross-slip gated out",
+  "exadis_base_sha": "20ea2e82cdb919581c0611c338a6e46f6ad3f008",
+  "build_validation": {
+    "audit_disabled_build": true,
+    "audit_enabled_build": true,
+    "final_build_A1_smoke_hazard_rows": 9206
+  },
+  "stock_A0": {
+    "audit_on_off_exact": true,
+    "density_m2": 1148530187979.0017,
+    "network_sha256": "c8a04cdfa8b9ee27f09ed910592d54facee2e65fae1915b7a5e3224518617d52",
+    "nodes": 11088,
+    "plastic_strain": 1.1768853406074455e-06,
+    "segments": 11940,
+    "strain": 1.021951400751762e-05,
+    "stress_Pa": 1307390.4867648063
+  },
+  "mobility_production_config_gate": {
+    "Rdt_median": 66.60962375488675,
+    "Rdt_p95": 733.7775180366785,
+    "adaptive_mean_rate_subcycling": true,
+    "held_out": {
+      "median_velocity_ratio": 1.2634004327784356,
+      "rmse_log10_abs_velocity": 0.4198329707605054,
+      "rows": 381900,
+      "sign_accuracy": 0.9999476302697041
+    },
+    "initial_network_states": 2,
+    "parameters_on_bounds": [],
+    "passed": true,
+    "temperatures_K": [
+      300.0,
+      500.0,
+      700.0,
+      900.0,
+      1100.0
+    ],
+    "training": {
+      "median_velocity_ratio": 1.2519144416464991,
+      "rmse_log10_abs_velocity": 0.37712981367738185,
+      "rows": 264900,
+      "sign_accuracy": 1.0
+    }
+  },
+  "native_A1": {
+    "audit_on_off_exact_short": true,
+    "hazard_rows_long": 385190,
+    "long_trajectory": {
+      "density_curve_max_relative_difference": 0.0019562799100052938,
+      "final_density_relative_difference": 0.0018295865512071375,
+      "final_node_count_relative_difference": 0.0005411255411255411,
+      "final_plastic_strain_relative_difference": 0.041851400101801745,
+      "final_segment_count_relative_difference": 0.0011725293132328308,
+      "final_stress_relative_difference": 0.07513308195279858,
+      "passed": true,
+      "stress_curve_max_difference_over_stock_peak": 0.01737236337282669,
+      "stress_curve_normalized_rmse": 0.009891654840342759
+    },
+    "transparent_barrier_fraction": 0.0
+  },
+  "topology": {
+    "Rdt_p95": 4.0603082258993,
+    "heldout_accuracy": 0.988622754491018,
+    "heldout_auc": 0.9954701096008908,
+    "parameters_on_bounds": [
+      "f",
+      "n"
+    ],
+    "replacement_blockers": [
+      "parameters pinned to bounds",
+      "Rdt p95 exceeds discrete-event limit",
+      "native event classes unresolved beyond generic multi-node split"
+    ],
+    "replacement_eligible": false,
+    "source_rows": 17775
+  },
+  "cross_slip": {
+    "Rdt_p95": 1.8030237845162946,
+    "heldout_accuracy": 0.8362077660110943,
+    "heldout_auc": 0.8255747108584682,
+    "parameters_on_bounds": [
+      "S_kB",
+      "log10_sigma_c_GPa",
+      "n"
+    ],
+    "replacement_blockers": [
+      "parameters pinned to bounds",
+      "Rdt p95 exceeds discrete-event limit",
+      "rejected native candidates lack executable alternate geometry"
+    ],
+    "replacement_eligible": false,
+    "source_rows": 3419
+  },
+  "collision": {
+    "replacement_eligible": false,
+    "stock_behavior": "deterministic core-overlap cleanup"
+  },
+  "campaign_3d": {
+    "run": false,
+    "reason": "A2 topology and A3 cross-slip gates failed"
+  }
+}

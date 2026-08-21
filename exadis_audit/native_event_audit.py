@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Run the stock high-performance ExaDiS driver with native audit off/on.
-
-This is an instrumentation-only gate.  It never installs an Arrhenius law and
-fails if the runtime-enabled native recorder changes the stock trajectory.
-"""
+"""Run stock or gate-passed Arrhenius ExaDiS with native audit off/on."""
 
 from __future__ import annotations
 
@@ -160,7 +156,45 @@ def _audit_counts(path: Path) -> tuple[dict[str, int], dict[str, dict[str, int]]
     }
 
 
-def _build_modules(state: dict[str, Any], net: Any, cross_slip: bool):
+def _arrhenius_mobility_params(args: argparse.Namespace) -> dict[str, Any]:
+    if args.arrhenius_mobility == "off":
+        return {}
+    if args.arrhenius_config_data is None:
+        raise ValueError("--arrhenius-mobility requires --arrhenius-config")
+    block_name = "mobility_peierls"
+    block = args.arrhenius_config_data.get(block_name)
+    if not isinstance(block, dict):
+        raise ValueError(f"Arrhenius config lacks object {block_name!r}")
+    if block.get("replacement_eligible") is not True:
+        raise ValueError(
+            "Arrhenius mobility parameter block is not marked replacement_eligible=true"
+        )
+    required = ("H_eV", "S_kB", "sigma_c_GPa", "f", "a", "n", "jump_b", "vstar_b3")
+    missing = [name for name in required if block.get(name) is None]
+    if missing:
+        raise ValueError(f"Arrhenius mobility config is incomplete: {', '.join(missing)}")
+    coupling = block.get("anisotropic_coupling", {})
+    params = {
+        "mode": args.arrhenius_mobility,
+        "temperature_K": args.arrhenius_temperature_K,
+        "eta0_s": args.arrhenius_eta0_default,
+        "vmax": float(block.get("vmax", 4000.0)),
+        **{name: float(block[name]) for name in required},
+        "a_nn": float(coupling.get("a_nn", 0.0)),
+        "a_mm": float(coupling.get("a_mm", 0.0)),
+        "a_np": float(coupling.get("a_np", 0.0)),
+        "a_other": float(coupling.get("a_other", 0.0)),
+    }
+    params["eta0_s"] = args.arrhenius_eta0_default
+    if args.arrhenius_mobility == "full":
+        for name in ("H_screw_eV", "sigma_c_screw_GPa", "vstar_screw_b3"):
+            if block.get(name) is None:
+                raise ValueError(f"full Arrhenius mobility config lacks {name}")
+            params[name] = float(block[name])
+    return params
+
+
+def _build_modules(state: dict[str, Any], net: Any, args: argparse.Namespace):
     from pyexadis_base import (
         CalForce,
         Collision,
@@ -172,10 +206,16 @@ def _build_modules(state: dict[str, Any], net: Any, cross_slip: bool):
     )
 
     force = CalForce(force_mode="SUBCYCLING_MODEL", state=state, Ngrid=64, cell=net.cell)
-    mobility = MobilityLaw(
-        mobility_law="FCC_0", state=state,
-        Medge=64103.0, Mscrew=64103.0, vmax=4000.0,
-    )
+    if args.arrhenius_mobility == "off":
+        mobility = MobilityLaw(
+            mobility_law="FCC_0", state=state,
+            Medge=64103.0, Mscrew=64103.0, vmax=4000.0,
+        )
+    else:
+        mobility = MobilityLaw(
+            mobility_law="FCC_0_ARRHENIUS", state=state,
+            **_arrhenius_mobility_params(args),
+        )
     integrator = TimeIntegration(
         integrator="Subcycling", rgroups=[0.0, 100.0, 600.0, 1600.0],
         state=state, force=force, mobility=mobility,
@@ -188,7 +228,7 @@ def _build_modules(state: dict[str, Any], net: Any, cross_slip: bool):
     remesh = Remesh(remesh_rule="LengthBased", state=state)
     cross = (
         CrossSlip(cross_slip_mode="ForceBasedParallel", state=state, force=force)
-        if cross_slip else None
+        if args.cross_slip else None
     )
     return force, mobility, integrator, collision, topology, remesh, cross
 
@@ -219,7 +259,7 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
     graph = ExaDisNet()
     graph.read_paradis(str(args.exadis_data), verbose=False)
     net = DisNetManager(graph)
-    modules = _build_modules(state, net, args.cross_slip)
+    modules = _build_modules(state, net, args)
     force, mobility, integrator, collision, topology, remesh, cross = modules
 
     sim = SimulateNetworkPerf(
@@ -333,7 +373,7 @@ def _compare(disabled: dict[str, Any], enabled: dict[str, Any], tolerance: float
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prove runtime native audit on/off invariance for stock FCC ExaDiS."
+        description="Run stock or gate-passed native Arrhenius FCC ExaDiS."
     )
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--exadis-root", type=Path, default=Path("core/exadis"))
@@ -349,7 +389,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--output-frequency", type=int, default=2_000_000_000)
     parser.add_argument("--tolerance", type=float, default=1.0e-12)
+    parser.add_argument(
+        "--audit-enabled-only", action="store_true",
+        help="run one audited case for calibration/validation; do not claim invariance",
+    )
     parser.add_argument("--cross-slip", action="store_true")
+    parser.add_argument(
+        "--arrhenius-mobility", choices=("off", "peierls", "full"), default="off"
+    )
+    parser.add_argument("--arrhenius-topology", choices=("off", "on"), default="off")
+    parser.add_argument("--arrhenius-cross-slip", choices=("off", "on"), default="off")
+    parser.add_argument(
+        "--arrhenius-collision", choices=("off", "activated-only"), default="off"
+    )
+    parser.add_argument("--arrhenius-temperature-K", type=float, default=None)
+    parser.add_argument("--arrhenius-eta0-default", type=float, default=1.0e12)
+    parser.add_argument("--arrhenius-config", type=Path, default=None)
     parser.add_argument(
         "--require-candidate-labels",
         action="append",
@@ -366,6 +421,25 @@ def main() -> int:
     args.exadis_root = (args.repo_root / args.exadis_root).resolve() if not args.exadis_root.is_absolute() else args.exadis_root
     args.exadis_data = (args.repo_root / args.exadis_data).resolve() if not args.exadis_data.is_absolute() else args.exadis_data
     args.outdir = (args.repo_root / args.outdir).resolve() if not args.outdir.is_absolute() else args.outdir
+    args.arrhenius_config_data = None
+    if args.arrhenius_config is not None:
+        config_path = (
+            args.repo_root / args.arrhenius_config
+            if not args.arrhenius_config.is_absolute() else args.arrhenius_config
+        ).resolve()
+        args.arrhenius_config_data = json.loads(config_path.read_text())
+        if args.arrhenius_temperature_K is None:
+            args.arrhenius_temperature_K = float(args.arrhenius_config_data.get("temperature_K", 0.0))
+    if args.arrhenius_mobility != "off" and not (args.arrhenius_temperature_K and args.arrhenius_temperature_K > 0.0):
+        raise SystemExit("requested Arrhenius mobility requires a positive temperature")
+    unsupported = []
+    if args.arrhenius_topology == "on": unsupported.append("topology")
+    if args.arrhenius_cross_slip == "on": unsupported.append("cross_slip")
+    if args.arrhenius_collision == "activated-only": unsupported.append("collision")
+    if unsupported:
+        raise SystemExit(
+            "requested Arrhenius module has not passed its replacement gate: " + ", ".join(unsupported)
+        )
 
     if not args.exadis_data.exists():
         raise SystemExit(f"ExaDiS input data not found: {args.exadis_data}")
@@ -383,26 +457,37 @@ def main() -> int:
     threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
     pyexadis.initialize(num_threads=threads, verbose=True)
     try:
-        disabled_dir = args.outdir / "audit_disabled"
         enabled_dir = args.outdir / "audit_enabled"
-        disabled_dir.mkdir()
         enabled_dir.mkdir()
-        disabled = _run_case(args, disabled_dir, audit_enabled=False)
+        if args.audit_enabled_only:
+            disabled = None
+        else:
+            disabled_dir = args.outdir / "audit_disabled"
+            disabled_dir.mkdir()
+            disabled = _run_case(args, disabled_dir, audit_enabled=False)
         enabled = _run_case(args, enabled_dir, audit_enabled=True)
     finally:
         pyexadis.finalize()
 
-    comparison = _compare(disabled, enabled, args.tolerance)
-    comparison_plot = args.outdir / "audit_comparison.svg"
-    _write_comparison_svg(
-        disabled_dir / "stress_strain_dens.dat",
-        enabled_dir / "stress_strain_dens.dat",
-        comparison_plot,
-    )
+    comparison = None if disabled is None else _compare(disabled, enabled, args.tolerance)
+    comparison_plot = None
+    if disabled is not None:
+        comparison_plot = args.outdir / "audit_comparison.svg"
+        _write_comparison_svg(
+            disabled_dir / "stress_strain_dens.dat",
+            enabled_dir / "stress_strain_dens.dat",
+            comparison_plot,
+        )
     report = {
-        "status": "passed" if comparison["passed"] else "failed",
-        "instrumentation_only": True,
-        "arrhenius_replacements_connected": False,
+        "status": (
+            "calibration_trace_complete" if comparison is None else
+            ("passed" if comparison["passed"] else "failed")
+        ),
+        "instrumentation_only": args.arrhenius_mobility == "off",
+        "arrhenius_replacements_connected": args.arrhenius_mobility != "off",
+        "arrhenius_stage": (
+            "A0_stock" if args.arrhenius_mobility == "off" else "A1_arrhenius_peierls_only"
+        ),
         "repository_sha": _git_sha(args.repo_root),
         "exadis_source_sha": _git_sha(args.exadis_root),
         "python_executable": sys.executable,
@@ -410,7 +495,8 @@ def main() -> int:
         "kokkos_backend": "OpenMP+Serial",
         "openmp_threads": threads,
         "mpi_used": False,
-        "comparison_plot": str(comparison_plot),
+        "comparison_plot": str(comparison_plot) if comparison_plot else None,
+        "audit_enabled_only": args.audit_enabled_only,
         "audit_disabled": disabled,
         "audit_enabled": enabled,
         "invariance": comparison,
@@ -419,10 +505,14 @@ def main() -> int:
         json.dumps(_clean(report), indent=2, sort_keys=True) + "\n"
     )
     print(json.dumps(_clean(comparison), indent=2, sort_keys=True))
-    if not comparison["passed"]:
+    if comparison is not None and not comparison["passed"]:
         raise SystemExit("native audit-on/audit-off invariance failed")
-    if enabled["audit_rows_by_mechanism"].get("mobility_fcc0", 0) == 0:
-        raise SystemExit("native audit produced no mobility_fcc0 rows")
+    expected_mobility = (
+        "mobility_fcc0" if args.arrhenius_mobility == "off" else
+        "mobility_fcc0_arrhenius"
+    )
+    if enabled["audit_rows_by_mechanism"].get(expected_mobility, 0) == 0:
+        raise SystemExit(f"native audit produced no {expected_mobility} rows")
     for mechanism in args.require_candidate_labels:
         counts = enabled["candidate_labels_by_mechanism"].get(mechanism, {})
         if counts.get("accepted", 0) == 0 or counts.get("rejected", 0) == 0:

@@ -1,0 +1,662 @@
+diff --git a/python/CMakeLists.txt b/python/CMakeLists.txt
+index a92ac89..44218fc 100644
+--- a/python/CMakeLists.txt
++++ b/python/CMakeLists.txt
+@@ -22,6 +22,7 @@ endif()
+ 
+ set(EXADIS_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+ set(SOURCES
++    ${EXADIS_SRC_PATH}/arrhenius/arrhenius_exp_floor.cpp
+     ${EXADIS_SRC_PATH}/driver.cpp
+     ${EXADIS_SRC_PATH}/generate.cpp
+     ${EXADIS_SRC_PATH}/network.cpp
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 45048c0..80c55a4 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ cmake_minimum_required(VERSION 3.14)
+ 
+ set(SOURCES
++    arrhenius/arrhenius_exp_floor.cpp
+     driver.cpp
+     generate.cpp
+     network.cpp
+diff --git a/src/arrhenius/arrhenius_exp_floor.cpp b/src/arrhenius/arrhenius_exp_floor.cpp
+new file mode 100644
+index 0000000..6535f79
+--- /dev/null
++++ b/src/arrhenius/arrhenius_exp_floor.cpp
+@@ -0,0 +1,30 @@
++#include "arrhenius/arrhenius_exp_floor.h"
++
++#include <sstream>
++#include <stdexcept>
++
++namespace ExaDiS {
++namespace Arrhenius {
++
++void validate(const ExpFloorParams& p, double temperature_K,
++              const std::string& mechanism)
++{
++    std::ostringstream errors;
++    if (!(std::isfinite(temperature_K) && temperature_K > 0.0)) errors << " temperature_K";
++    if (!(std::isfinite(p.H_eV) && p.H_eV > 0.0)) errors << " H_eV";
++    if (!std::isfinite(p.S_kB)) errors << " S_kB";
++    if (!(std::isfinite(p.sigma_c_Pa) && p.sigma_c_Pa > 0.0)) errors << " sigma_c";
++    if (!(std::isfinite(p.floor_fraction) && p.floor_fraction >= 0.0 &&
++          p.floor_fraction <= 1.0)) errors << " f";
++    if (!(std::isfinite(p.shape_a) && p.shape_a > 0.0)) errors << " a";
++    if (!(std::isfinite(p.shape_n) && p.shape_n > 0.0)) errors << " n";
++    if (!(std::isfinite(p.eta0_s) && p.eta0_s > 0.0)) errors << " eta0_s";
++    if (!(std::isfinite(p.vstar_m3) && p.vstar_m3 > 0.0)) errors << " vstar";
++    if (!errors.str().empty()) {
++        throw std::invalid_argument(
++            "invalid or missing " + mechanism + " EXP-floor parameter(s):" + errors.str());
++    }
++}
++
++} // namespace Arrhenius
++} // namespace ExaDiS
+diff --git a/src/arrhenius/arrhenius_exp_floor.h b/src/arrhenius/arrhenius_exp_floor.h
+new file mode 100644
+index 0000000..b9a50a0
+--- /dev/null
++++ b/src/arrhenius/arrhenius_exp_floor.h
+@@ -0,0 +1,137 @@
++/*---------------------------------------------------------------------------
++ * Native transition-state-theory EXP-floor hazard shared by ExaDiS modules.
++ *-------------------------------------------------------------------------*/
++
++#pragma once
++#ifndef EXADIS_ARRHENIUS_EXP_FLOOR_H
++#define EXADIS_ARRHENIUS_EXP_FLOOR_H
++
++#include "types.h"
++
++#include <cmath>
++#include <string>
++
++namespace ExaDiS {
++namespace Arrhenius {
++
++constexpr double KB_EV_K = 8.617333262145e-5;
++constexpr double EV_J = 1.602176634e-19;
++constexpr double DEFAULT_ETA0_S = 1.0e12;
++
++struct ExpFloorParams {
++    double H_eV = -1.0;
++    double S_kB = 0.0;
++    double sigma_c_Pa = -1.0;
++    double floor_fraction = -1.0;
++    double shape_a = -1.0;
++    double shape_n = -1.0;
++    double eta0_s = DEFAULT_ETA0_S;
++    double vstar_m3 = -1.0;
++};
++
++struct StressCoupling {
++    double a_nn = 0.0;
++    double a_mm = 0.0;
++    double a_np = 0.0;
++    double a_other = 0.0;
++};
++
++struct StressComponents {
++    double tau_s_Pa = 0.0;
++    double sigma_nn_Pa = 0.0;
++    double sigma_mm_Pa = 0.0;
++    double sigma_np_Pa = 0.0;
++    double sigma_other_Pa = 0.0;
++};
++
++struct Evaluation {
++    double tau_eff_Pa = 0.0;
++    double activation_work_J = 0.0;
++    double G_eV = 0.0;
++    double G_floor_eV = 0.0;
++    double G_used_eV = 0.0;
++    double rate_s = 0.0;
++    double Rdt = 0.0;
++    double probability = 0.0;
++};
++
++KOKKOS_INLINE_FUNCTION
++double effective_stress_Pa(const StressComponents& stress,
++                           const StressCoupling& coupling)
++{
++    return stress.tau_s_Pa +
++           coupling.a_nn * stress.sigma_nn_Pa +
++           coupling.a_mm * stress.sigma_mm_Pa +
++           coupling.a_np * stress.sigma_np_Pa +
++           coupling.a_other * stress.sigma_other_Pa;
++}
++
++KOKKOS_INLINE_FUNCTION
++double tensor_activation_work_J(const Mat33& sigma_Pa,
++                                const Mat33& activation_tensor_m3)
++{
++    return dot(sigma_Pa, activation_tensor_m3);
++}
++
++KOKKOS_INLINE_FUNCTION
++double tensor_effective_stress_Pa(const Mat33& sigma_Pa,
++                                  const Mat33& activation_tensor_m3,
++                                  double vstar_m3)
++{
++    return tensor_activation_work_J(sigma_Pa, activation_tensor_m3) / vstar_m3;
++}
++
++KOKKOS_INLINE_FUNCTION
++Evaluation evaluate(double tau_eff_Pa, double temperature_K, double dt_s,
++                    const ExpFloorParams& params)
++{
++    Evaluation out;
++    out.tau_eff_Pa = tau_eff_Pa;
++    out.activation_work_J = tau_eff_Pa * params.vstar_m3;
++
++    const double drive = tau_eff_Pa > 0.0 ? tau_eff_Pa : 0.0;
++    const double ratio = drive / params.sigma_c_Pa;
++    const double shaped = params.H_eV *
++        (params.floor_fraction + (1.0 - params.floor_fraction) *
++         exp(-params.shape_a * pow(ratio, params.shape_n)));
++    out.G_eV = shaped - KB_EV_K * temperature_K * params.S_kB;
++    out.G_floor_eV = params.floor_fraction * params.H_eV -
++                     KB_EV_K * temperature_K * params.S_kB;
++    const double floor_nonnegative = out.G_floor_eV > 0.0 ? out.G_floor_eV : 0.0;
++    out.G_used_eV = out.G_eV > floor_nonnegative ? out.G_eV : floor_nonnegative;
++    out.rate_s = params.eta0_s * exp(-out.G_used_eV / (KB_EV_K * temperature_K));
++    out.Rdt = out.rate_s * (dt_s > 0.0 ? dt_s : 0.0);
++    out.probability = -expm1(-out.Rdt);
++    return out;
++}
++
++KOKKOS_INLINE_FUNCTION
++Evaluation evaluate_tensor(const Mat33& sigma_Pa,
++                           const Mat33& activation_tensor_m3,
++                           double temperature_K, double dt_s,
++                           const ExpFloorParams& params)
++{
++    Evaluation out = evaluate(
++        tensor_effective_stress_Pa(
++            sigma_Pa, activation_tensor_m3, params.vstar_m3),
++        temperature_K, dt_s, params);
++    out.activation_work_J = tensor_activation_work_J(
++        sigma_Pa, activation_tensor_m3);
++    return out;
++}
++
++KOKKOS_INLINE_FUNCTION
++double signed_rate_s(double tau_eff_Pa, double temperature_K,
++                     const ExpFloorParams& params)
++{
++    return evaluate(tau_eff_Pa, temperature_K, 0.0, params).rate_s -
++           evaluate(-tau_eff_Pa, temperature_K, 0.0, params).rate_s;
++}
++
++void validate(const ExpFloorParams& params, double temperature_K,
++              const std::string& mechanism);
++
++} // namespace Arrhenius
++} // namespace ExaDiS
++
++#endif
+diff --git a/src/audit/event_audit.cpp b/src/audit/event_audit.cpp
+index 5add736..d45ac53 100644
+--- a/src/audit/event_audit.cpp
++++ b/src/audit/event_audit.cpp
+@@ -174,11 +174,13 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+     std::fprintf(stream_,
+         "{\"record_type\":\"event\",\"step\":%ld,\"time_s\":%.17g,"
+         "\"dt_s\":%.17g,\"mechanism\":\"%s\",\"stage\":\"%s\","
++        "\"event_class\":\"%s\","
+         "\"candidate_id\":%d,\"node_id\":%d,\"seg_id\":%d,\"seg2_id\":%d,"
+         "\"created_node_id\":%d,\"created_seg_id\":%d,"
+         "\"n1\":%d,\"n2\":%d,\"L_m\":%.17g",
+         row.step, row.time_s, row.dt_s,
+         json_escape(row.mechanism).c_str(), json_escape(row.stage).c_str(),
++        json_escape(row.event_class).c_str(),
+         row.candidate_id, row.node_id, row.seg_id, row.seg2_id,
+         row.created_node_id, row.created_seg_id,
+         row.n1, row.n2, row.L_m);
+@@ -187,6 +189,7 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+     write_vec3(stream_, "current_plane", row.current_plane);
+     write_vec3(stream_, "line", row.line);
+     write_vec6(stream_, "applied_stress_Pa", row.applied_stress_Pa);
++    write_vec6(stream_, "activation_tensor_m3", row.activation_tensor_m3);
+     write_vec3(stream_, "force_N", row.force_N);
+     write_vec3(stream_, "velocity_m_s", row.velocity_m_s);
+     write_vec3(stream_, "before_force_N", row.before_force_N);
+@@ -201,6 +204,13 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         "\"arm_mobility_internal\":%.17g,"
+         "\"L_over_mobility_internal\":%.17g,\"LtimesB_internal\":%.17g,"
+         "\"tau_local_Pa\":%.17g,\"tau_eff_Pa\":%.17g,"
++        "\"temperature_K\":%.17g,\"H_eV\":%.17g,\"S_kB\":%.17g,"
++        "\"sigma_c_GPa\":%.17g,\"floor_fraction_f\":%.17g,"
++        "\"shape_a\":%.17g,\"shape_n\":%.17g,\"eta0_s\":%.17g,"
++        "\"activation_work_J\":%.17g,\"G_eV\":%.17g,"
++        "\"G_floor_eV\":%.17g,\"G_used_eV\":%.17g,\"R_s\":%.17g,"
++        "\"Rdt\":%.17g,\"P\":%.17g,\"selection_threshold\":%.17g,"
++        "\"accepted_arrhenius\":%d,"
+         "\"x_dagger_m\":%.17g,\"v_star_m3\":%.17g,"
+         "\"delta_work_J\":%.17g,\"before_power_W\":%.17g,"
+         "\"after_power_W\":%.17g,\"delta_power_W\":%.17g,"
+@@ -212,7 +222,12 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         row.arm_mobility_internal, row.L_over_mobility_internal,
+         row.LtimesB_internal,
+         row.tau_local_Pa,
+-        row.tau_eff_Pa, row.x_dagger_m, row.v_star_m3,
++        row.tau_eff_Pa, row.temperature_K, row.H_eV, row.S_kB,
++        row.sigma_c_GPa, row.floor_fraction_f, row.shape_a, row.shape_n,
++        row.eta0_s, row.activation_work_J, row.G_eV, row.G_floor_eV,
++        row.G_used_eV, row.R_s, row.Rdt, row.probability,
++        row.selection_threshold, row.accepted_arrhenius,
++        row.x_dagger_m, row.v_star_m3,
+         row.delta_work_J, row.before_power_W, row.after_power_W,
+         row.delta_power_W, row.before_energy_J, row.after_energy_J,
+         row.delta_energy_J, row.accepted_stock,
+diff --git a/src/audit/event_audit.h b/src/audit/event_audit.h
+index 57061a4..1e9b264 100644
+--- a/src/audit/event_audit.h
++++ b/src/audit/event_audit.h
+@@ -37,6 +37,7 @@ struct EventAuditRecord {
+     double dt_s = 0.0;
+     std::string mechanism;
+     std::string stage;
++    std::string event_class;
+     int candidate_id = -1;
+     int node_id = -1;
+     int seg_id = -1;
+@@ -67,6 +68,24 @@ struct EventAuditRecord {
+     double LtimesB_internal = 0.0;
+     double tau_local_Pa = 0.0;
+     double tau_eff_Pa = 0.0;
++    double activation_tensor_m3[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++    double temperature_K = 0.0;
++    double H_eV = 0.0;
++    double S_kB = 0.0;
++    double sigma_c_GPa = 0.0;
++    double floor_fraction_f = 0.0;
++    double shape_a = 0.0;
++    double shape_n = 0.0;
++    double eta0_s = 0.0;
++    double activation_work_J = 0.0;
++    double G_eV = 0.0;
++    double G_floor_eV = 0.0;
++    double G_used_eV = 0.0;
++    double R_s = 0.0;
++    double Rdt = 0.0;
++    double probability = 0.0;
++    double selection_threshold = -1.0;
++    int accepted_arrhenius = -1;
+     double x_dagger_m = 0.0;
+     double v_star_m3 = 0.0;
+     double delta_work_J = 0.0;
+diff --git a/src/mobility_types/mobility_fcc0_arrhenius.h b/src/mobility_types/mobility_fcc0_arrhenius.h
+new file mode 100644
+index 0000000..9c8011f
+--- /dev/null
++++ b/src/mobility_types/mobility_fcc0_arrhenius.h
+@@ -0,0 +1,362 @@
++/*---------------------------------------------------------------------------
++ * Native FCC mobility driven by directional EXP-floor TST hazards.
++ *-------------------------------------------------------------------------*/
++
++#pragma once
++#ifndef EXADIS_MOBILITY_FCC0_ARRHENIUS_H
++#define EXADIS_MOBILITY_FCC0_ARRHENIUS_H
++
++#include "arrhenius/arrhenius_exp_floor.h"
++#include "mobility.h"
++
++#include <string>
++
++namespace ExaDiS {
++
++struct MobilityFCC0Arrhenius
++{
++    bool non_linear = true;
++    int mode = 1; // 1: peierls, 2: character-dependent full surrogate
++    double temperature_K = -1.0;
++    double jump_b = -1.0;
++    double vmax = -1.0;
++    Arrhenius::ExpFloorParams peierls;
++    Arrhenius::ExpFloorParams screw;
++    Arrhenius::StressCoupling coupling;
++
++    struct Params {
++        std::string mode = "peierls";
++        double temperature_K = -1.0;
++        double H_eV = -1.0;
++        double S_kB = 0.0;
++        double sigma_c_GPa = -1.0;
++        double f = -1.0;
++        double a = -1.0;
++        double n = -1.0;
++        double eta0_s = Arrhenius::DEFAULT_ETA0_S;
++        double vstar_b3 = -1.0;
++        double jump_b = -1.0;
++        double H_screw_eV = -1.0;
++        double sigma_c_screw_GPa = -1.0;
++        double vstar_screw_b3 = -1.0;
++        double a_nn = 0.0;
++        double a_mm = 0.0;
++        double a_np = 0.0;
++        double a_other = 0.0;
++        double vmax = -1.0;
++
++        Params() = default;
++        Params(Dict paramslist) {
++            for (auto const& [key, val] : paramslist) {
++                const std::string name = dict::get_key(key);
++                if      (name == "mode") mode = dict::get_val<std::string>(val);
++                else if (name == "temperature_K") temperature_K = dict::get_val<double>(val);
++                else if (name == "H_eV") H_eV = dict::get_val<double>(val);
++                else if (name == "S_kB") S_kB = dict::get_val<double>(val);
++                else if (name == "sigma_c_GPa") sigma_c_GPa = dict::get_val<double>(val);
++                else if (name == "f") f = dict::get_val<double>(val);
++                else if (name == "a") a = dict::get_val<double>(val);
++                else if (name == "n") n = dict::get_val<double>(val);
++                else if (name == "eta0_s") eta0_s = dict::get_val<double>(val);
++                else if (name == "vstar_b3") vstar_b3 = dict::get_val<double>(val);
++                else if (name == "jump_b") jump_b = dict::get_val<double>(val);
++                else if (name == "H_screw_eV") H_screw_eV = dict::get_val<double>(val);
++                else if (name == "sigma_c_screw_GPa") sigma_c_screw_GPa = dict::get_val<double>(val);
++                else if (name == "vstar_screw_b3") vstar_screw_b3 = dict::get_val<double>(val);
++                else if (name == "a_nn") a_nn = dict::get_val<double>(val);
++                else if (name == "a_mm") a_mm = dict::get_val<double>(val);
++                else if (name == "a_np") a_np = dict::get_val<double>(val);
++                else if (name == "a_other") a_other = dict::get_val<double>(val);
++                else if (name == "vmax") vmax = dict::get_val<double>(val);
++                else ExaDiS_fatal("Error: unknown MobilityFCC0Arrhenius input parameter %s\n", name.c_str());
++            }
++        }
++    };
++
++    struct NodeDiagnostics {
++        double tau_force_Pa = 0.0;
++        double tau_eff_Pa = 0.0;
++        double character_screw_abs = 0.0;
++        double half_length_internal = 0.0;
++        Vec3 direction;
++        Vec3 slip;
++        Vec3 plane;
++        Vec3 transverse;
++        Arrhenius::ExpFloorParams params;
++        Arrhenius::Evaluation forward;
++        Arrhenius::Evaluation reverse;
++    };
++
++    MobilityFCC0Arrhenius(System* system, Params& p)
++    {
++        if (system->crystal.type != FCC_CRYSTAL)
++            ExaDiS_fatal("Error: MobilityFCC0Arrhenius must be used with FCC crystal type\n");
++        if (!system->crystal.use_glide_planes)
++            ExaDiS_fatal("Error: MobilityFCC0Arrhenius requires glide planes\n");
++        if (p.mode == "peierls") mode = 1;
++        else if (p.mode == "full") mode = 2;
++        else ExaDiS_fatal("Error: MobilityFCC0Arrhenius mode must be peierls or full\n");
++
++        const double b3 = system->params.burgmag * system->params.burgmag *
++                          system->params.burgmag;
++        temperature_K = p.temperature_K;
++        jump_b = p.jump_b;
++        vmax = p.vmax;
++        peierls.H_eV = p.H_eV;
++        peierls.S_kB = p.S_kB;
++        peierls.sigma_c_Pa = p.sigma_c_GPa * 1.0e9;
++        peierls.floor_fraction = p.f;
++        peierls.shape_a = p.a;
++        peierls.shape_n = p.n;
++        peierls.eta0_s = p.eta0_s;
++        peierls.vstar_m3 = p.vstar_b3 * b3;
++        screw = peierls;
++        if (mode == 2) {
++            screw.H_eV = p.H_screw_eV;
++            screw.sigma_c_Pa = p.sigma_c_screw_GPa * 1.0e9;
++            screw.vstar_m3 = p.vstar_screw_b3 * b3;
++        }
++        coupling.a_nn = p.a_nn;
++        coupling.a_mm = p.a_mm;
++        coupling.a_np = p.a_np;
++        coupling.a_other = p.a_other;
++
++        try {
++            Arrhenius::validate(peierls, temperature_K, "FCC Peierls");
++            if (mode == 2) Arrhenius::validate(screw, temperature_K, "FCC screw Peierls");
++        } catch (const std::exception& error) {
++            ExaDiS_fatal("Error: %s\n", error.what());
++        }
++        if (!(std::isfinite(jump_b) && jump_b > 0.0))
++            ExaDiS_fatal("Error: invalid or missing FCC Arrhenius jump_b\n");
++        if (!std::isfinite(vmax))
++            ExaDiS_fatal("Error: invalid FCC Arrhenius vmax\n");
++        if (!(std::isfinite(coupling.a_nn) && std::isfinite(coupling.a_mm) &&
++              std::isfinite(coupling.a_np) && std::isfinite(coupling.a_other)))
++            ExaDiS_fatal("Error: invalid FCC Arrhenius anisotropic coupling\n");
++    }
++
++    KOKKOS_INLINE_FUNCTION
++    Arrhenius::ExpFloorParams character_params(double screw_fraction) const
++    {
++        if (mode != 2) return peierls;
++        Arrhenius::ExpFloorParams p = peierls;
++        p.H_eV += screw_fraction * (screw.H_eV - peierls.H_eV);
++        p.sigma_c_Pa += screw_fraction * (screw.sigma_c_Pa - peierls.sigma_c_Pa);
++        p.vstar_m3 += screw_fraction * (screw.vstar_m3 - peierls.vstar_m3);
++        return p;
++    }
++
++    template<class N>
++    KOKKOS_INLINE_FUNCTION
++    Vec3 node_velocity_impl(System* system, N* net, const int& i, const Vec3& fi,
++                            NodeDiagnostics* diagnostic) const
++    {
++        auto nodes = net->get_nodes();
++        auto segs = net->get_segs();
++        auto conn = net->get_conn();
++        const Cell cell = net->cell;
++        Vec3 vi(0.0);
++        const int nconn = conn[i].num;
++        if (nconn < 2 || nodes[i].constraint == PINNED_NODE) return vi;
++
++        const double eps = 1.0e-10;
++        Vec3 normals[3], line_constraint;
++        int ngc = 0, nlc = 0, nonzero = 0;
++        Mat33 P = Mat33().eye();
++        double total_length = 0.0;
++        double screw_weight = 0.0;
++        Vec3 msum(0.0), nsum(0.0), psum(0.0);
++        const Vec3 r1 = nodes[i].pos;
++
++        for (int j = 0; j < nconn; ++j) {
++            const int k = conn[i].node[j];
++            Vec3 dr = cell.pbc_position(r1, nodes[k].pos) - r1;
++            const double L = dr.norm();
++            if (L < eps) continue;
++            dr = (1.0 / L) * dr;
++            ++nonzero;
++            total_length += L;
++
++            const int s = conn[i].seg[j];
++            const Vec3 burg = conn[i].order[j] * segs[s].burg;
++            const double bmag = burg.norm();
++            const Vec3 m = bmag > eps ? (1.0 / bmag) * burg : Vec3(0.0);
++            const double character = bmag > eps ? fabs(dot(m, dr)) : 0.0;
++            screw_weight += L * character;
++
++            Vec3 plane = segs[s].plane.normalized();
++            Vec3 transverse = cross(plane, m);
++            if (transverse.norm2() > eps) transverse = transverse.normalized();
++            msum += L * m;
++            nsum += L * plane;
++            psum += L * transverse;
++
++            const Vec3 crystal_plane = system->crystal.Rinv * plane;
++            Vec3 line(0.0);
++            if ((fabs(fabs(crystal_plane.x) - fabs(crystal_plane.y)) > 1e-4) ||
++                (fabs(fabs(crystal_plane.y) - fabs(crystal_plane.z)) > 1e-4))
++                line = dr;
++            if (ngc < 3) {
++                for (int q = 0; q < ngc; ++q) plane = plane.orthogonalize(normals[q]);
++                if (plane.norm2() >= 0.05) {
++                    plane = plane.normalized();
++                    P = (Mat33().eye() - outer(plane, plane)) * P;
++                    normals[ngc++] = plane;
++                }
++            }
++            if (nlc < 2) {
++                if (nlc == 1) line = line.orthogonalize(line_constraint);
++                if (line.norm2() >= 0.05) {
++                    line_constraint = line.normalized();
++                    ++nlc;
++                }
++            }
++        }
++        if (nonzero == 0 || total_length <= 0.0) return vi;
++        if (nlc == 1) {
++            P = outer(line_constraint, line_constraint) * P;
++            for (int q = 0; q < ngc; ++q)
++                if (fabs(dot(normals[q], line_constraint)) > 0.05) P.zero();
++        } else if (nlc >= 2) {
++            P.zero();
++        }
++        for (int q = 0; q < 3; ++q)
++            for (int r = 0; r < 3; ++r)
++                if (fabs(P[q][r]) < 1e-10) P[q][r] = 0.0;
++
++        const Vec3 drive = P * fi;
++        const double drive_norm = drive.norm();
++        if (drive_norm <= eps) return vi;
++        const Vec3 direction = (1.0 / drive_norm) * drive;
++        const double half_length = 0.5 * total_length;
++        const double tau_force = drive_norm / half_length;
++        const double screw_fraction = screw_weight / total_length;
++
++        Vec3 m = msum.norm2() > eps ? msum.normalized() : Vec3(0.0);
++        Vec3 n = nsum.norm2() > eps ? nsum.normalized() : Vec3(0.0);
++        Vec3 transverse = psum.norm2() > eps ? psum.normalized() : Vec3(0.0);
++        Arrhenius::StressComponents components;
++        components.tau_s_Pa = tau_force;
++        components.sigma_nn_Pa = dot(n, system->extstress * n);
++        components.sigma_mm_Pa = dot(m, system->extstress * m);
++        components.sigma_np_Pa = dot(n, system->extstress * transverse);
++        const double tau_eff = Arrhenius::effective_stress_Pa(components, coupling);
++        const Arrhenius::ExpFloorParams hp = character_params(screw_fraction);
++        const Arrhenius::Evaluation forward =
++            Arrhenius::evaluate(tau_eff, temperature_K, system->realdt, hp);
++        const Arrhenius::Evaluation reverse =
++            Arrhenius::evaluate(-tau_eff, temperature_K, system->realdt, hp);
++        const double speed_internal = jump_b * (forward.rate_s - reverse.rate_s);
++        vi = speed_internal * direction;
++        if (vmax > 0.0) apply_velocity_cap(vmax, system->params.burgmag, vi);
++
++        if (diagnostic) {
++            diagnostic->tau_force_Pa = tau_force;
++            diagnostic->tau_eff_Pa = tau_eff;
++            diagnostic->character_screw_abs = screw_fraction;
++            diagnostic->half_length_internal = half_length;
++            diagnostic->direction = direction;
++            diagnostic->slip = m;
++            diagnostic->plane = n;
++            diagnostic->transverse = transverse;
++            diagnostic->params = hp;
++            diagnostic->forward = forward;
++            diagnostic->reverse = reverse;
++        }
++        return vi;
++    }
++
++    template<class N>
++    KOKKOS_INLINE_FUNCTION
++    Vec3 node_velocity(System* system, N* net, const int& i, const Vec3& fi)
++    {
++        return node_velocity_impl(system, net, i, fi, nullptr);
++    }
++
++    static constexpr const char* name = "MobilityFCC0Arrhenius";
++};
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++inline void audit_mobility(System* system, MobilityFCC0Arrhenius* mob)
++{
++    EventAuditRecorder* audit = system->event_audit;
++    if (!audit || !audit->claim_mobility_snapshot()) return;
++    SerialDisNet* net = system->get_serial_network();
++    const double b_m = system->params.burgmag;
++    const double b3 = b_m * b_m * b_m;
++    for (int i = 0; i < net->number_of_nodes(); ++i) {
++        MobilityFCC0Arrhenius::NodeDiagnostics d;
++        const Vec3 fi = net->nodes[i].f;
++        const Vec3 vi = mob->node_velocity_impl(system, net, i, fi, &d);
++        if (d.half_length_internal <= 0.0) continue;
++        const Arrhenius::Evaluation evals[2] = {d.forward, d.reverse};
++        const char* classes[2] = {"peierls_forward", "peierls_reverse"};
++        for (int direction = 0; direction < 2; ++direction) {
++            EventAuditRecord row;
++            row.step = audit->step();
++            row.time_s = audit->time_s();
++            row.dt_s = system->realdt;
++            row.mechanism = "mobility_fcc0_arrhenius";
++            row.stage = "mobility";
++            row.event_class = classes[direction];
++            row.candidate_id = 2 * i + direction;
++            row.node_id = i;
++            row.L_m = 2.0 * d.half_length_internal * b_m;
++            row.character_screw_abs = d.character_screw_abs;
++            row.force_N[0] = fi.x * b_m * b_m;
++            row.force_N[1] = fi.y * b_m * b_m;
++            row.force_N[2] = fi.z * b_m * b_m;
++            row.velocity_m_s[0] = vi.x * b_m;
++            row.velocity_m_s[1] = vi.y * b_m;
++            row.velocity_m_s[2] = vi.z * b_m;
++            row.tau_local_Pa = d.tau_force_Pa;
++            row.tau_eff_Pa = evals[direction].tau_eff_Pa;
++            row.temperature_K = mob->temperature_K;
++            row.H_eV = d.params.H_eV;
++            row.S_kB = d.params.S_kB;
++            row.sigma_c_GPa = d.params.sigma_c_Pa / 1.0e9;
++            row.floor_fraction_f = d.params.floor_fraction;
++            row.shape_a = d.params.shape_a;
++            row.shape_n = d.params.shape_n;
++            row.eta0_s = d.params.eta0_s;
++            row.v_star_m3 = d.params.vstar_m3;
++            row.activation_work_J = evals[direction].activation_work_J;
++            row.G_eV = evals[direction].G_eV;
++            row.G_floor_eV = evals[direction].G_floor_eV;
++            row.G_used_eV = evals[direction].G_used_eV;
++            row.R_s = evals[direction].rate_s;
++            row.Rdt = evals[direction].Rdt;
++            row.probability = evals[direction].probability;
++            row.selection_threshold = -1.0;
++            row.accepted_arrhenius = -1;
++            const double sign = direction == 0 ? 1.0 : -1.0;
++            const Mat33 A = d.params.vstar_m3 *
++                (0.5 * sign * (outer(d.slip, d.plane) + outer(d.plane, d.slip)) +
++                 mob->coupling.a_nn * outer(d.plane, d.plane) +
++                 mob->coupling.a_mm * outer(d.slip, d.slip) +
++                 0.5 * mob->coupling.a_np *
++                    (outer(d.plane, d.transverse) + outer(d.transverse, d.plane)));
++            row.activation_tensor_m3[0] = A.xx();
++            row.activation_tensor_m3[1] = A.yy();
++            row.activation_tensor_m3[2] = A.zz();
++            row.activation_tensor_m3[3] = A.yz();
++            row.activation_tensor_m3[4] = A.xz();
++            row.activation_tensor_m3[5] = A.xy();
++            row.note = "directional_EXP_floor_mean_rate;no_Bernoulli_draw;"
++                       "tau_force=norm(PF)/(half_total_line_length);W=sigma:A_audited";
++            audit->write(row, system);
++        }
++    }
++}
++#endif
++
++namespace MobilityType {
++    typedef MobilityLocal<MobilityFCC0Arrhenius> FCC_0_ARRHENIUS;
++}
++
++} // namespace ExaDiS
++
++EXADIS_MOBILITY(MobilityFCC0Arrhenius, FCC_0_ARRHENIUS)
++
++#endif

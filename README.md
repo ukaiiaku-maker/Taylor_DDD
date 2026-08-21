@@ -4,6 +4,19 @@ OpenDiS-style reduced DDD drivers for studying Taylor hardening with Arrhenius P
 
 This repository collects the most recent self-contained driver used in the reduced Taylor-hardening studies, analysis scripts for flow-stress and avalanche/burst diagnostics, unattended campaign launchers, and archived intermediate versions that document the development path.
 
+## Native ExaDiS A1 model
+
+The branch `arrhenius-exadis-strain-hardening` also carries an ordered native
+patch stack pinned to LLNL ExaDiS SHA
+`20ea2e82cdb919581c0611c338a6e46f6ad3f008`. It provides the native audit,
+shared EXP-floor kernel, and gate-passed A1 Arrhenius Peierls mobility while
+leaving stock ExaDiS as the default. Topology and cross slip remain fail-closed
+because their native replacement gates did not pass.
+
+See [the staged native report](docs/EXADIS_NATIVE_ARRHENIUS_STAGE_REPORT.md) for
+the fit evidence, exact source blockers, validation metrics, and reproduction
+commands.
+
 ## Current recommended driver
 
 Use the v17 driver for new reduced-model work:

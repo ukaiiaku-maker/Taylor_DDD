@@ -1,4 +1,9 @@
-# Native ExaDiS Arrhenius hook scaffold
+# Historical native ExaDiS Arrhenius hook scaffold
+
+This directory is the earlier unconnected interface scaffold. It is not the
+production conversion path. The buildable native implementation is exported in
+`exadis_native_patches/0002-native-arrhenius-exp-floor.patch` and documented in
+`docs/EXADIS_NATIVE_ARRHENIUS_STAGE_REPORT.md`.
 
 This directory contains the first native-interface scaffold for moving the
 Arrhenius/TST laws from the reduced Taylor drivers into ExaDiS/ParaDiS-style

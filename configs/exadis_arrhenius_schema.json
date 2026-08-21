@@ -1,0 +1,30 @@
+{
+  "temperature_K": 900.0,
+  "eta0_default_s": 1000000000000.0,
+  "mobility_peierls": {
+    "replacement_eligible": false,
+    "H_eV": null,
+    "S_kB": null,
+    "sigma_c_GPa": null,
+    "f": null,
+    "a": null,
+    "n": null,
+    "jump_b": null,
+    "vstar_b3": null,
+    "anisotropic_coupling": {
+      "a_nn": 0.0,
+      "a_mm": 0.0,
+      "a_np": 0.0,
+      "a_other": 0.0
+    }
+  },
+  "topology": {
+    "replacement_eligible": false
+  },
+  "cross_slip": {
+    "replacement_eligible": false
+  },
+  "collision": {
+    "replacement_eligible": false
+  }
+}
