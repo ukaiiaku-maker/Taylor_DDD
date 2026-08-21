@@ -1,0 +1,107 @@
+{
+  "temperature_K": 900.0,
+  "eta0_default_s": 1000000000000.0,
+  "mobility_peierls": {
+    "replacement_eligible": true,
+    "H_eV": 0.09995437449929806,
+    "S_kB": 0.0,
+    "sigma_c_GPa": 0.039583654511514035,
+    "f": 0.5295666921002267,
+    "a": 36.50895532789194,
+    "n": 0.9325720424960138,
+    "jump_b": 0.23154770572269381,
+    "vstar_b3": 390.8009690090542,
+    "stress_concentration_phi": 1.0,
+    "intrinsic_activation_volume_b3": 390.8009690090542,
+    "site_multiplicity": 1.6749048554676127,
+    "event_strain_increment": "native_mean_rate_swept_area",
+    "attempt_frequency_temperature_exponent": 1.0,
+    "attempt_frequency_reference_temperature_K": 900.0,
+    "vmax": 4000.0,
+    "anisotropic_coupling": {
+      "a_nn": 0.0,
+      "a_mm": 0.0,
+      "a_np": 0.0,
+      "a_other": 0.0,
+      "abs_effective_stress": false
+    }
+  },
+  "topology": {
+    "replacement_eligible": true,
+    "kinetic_scheme": "persistent_cumulative_hazard_with_deterministic_high_hazard_limit",
+    "mechanisms": {
+      "junction_zip": {
+        "H_eV": 0.85, "S_kB": 0.0, "sigma_c_GPa": 0.25,
+        "f": 0.05, "a": 6.0, "n": 1.2, "vstar_b3": 20.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 20.0,
+        "site_multiplicity": 1.0, "event_strain_increment": "native_split_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0
+      },
+      "junction_unzip": {
+        "H_eV": 0.75, "S_kB": 0.0, "sigma_c_GPa": 0.25,
+        "f": 0.05, "a": 6.0, "n": 1.2, "vstar_b3": 20.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 20.0,
+        "site_multiplicity": 1.0, "event_strain_increment": "native_split_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0
+      },
+      "junction_destruction": {
+        "H_eV": 0.80, "S_kB": 0.0, "sigma_c_GPa": 0.25,
+        "f": 0.05, "a": 6.0, "n": 1.2, "vstar_b3": 20.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 20.0,
+        "site_multiplicity": 1.0, "event_strain_increment": "native_split_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0
+      },
+      "junction_reconfiguration": {
+        "H_eV": 0.85, "S_kB": 0.0, "sigma_c_GPa": 0.25,
+        "f": 0.05, "a": 6.0, "n": 1.2, "vstar_b3": 20.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 20.0,
+        "site_multiplicity": 1.0, "event_strain_increment": "native_split_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0
+      },
+      "forest_depinning_like_release": {
+        "H_eV": 0.70, "S_kB": 0.0, "sigma_c_GPa": 0.20,
+        "f": 0.05, "a": 6.0, "n": 1.2, "vstar_b3": 15.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 15.0,
+        "site_multiplicity": 1.0, "event_strain_increment": "native_split_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0
+      }
+    }
+  },
+  "cross_slip": {
+    "replacement_eligible": true,
+    "kinetic_scheme": "geometry_first_persistent_cumulative_hazard",
+    "mechanisms": {
+      "plane_change": {
+        "H_eV": 2.00, "S_kB": 0.0, "sigma_c_GPa": 0.02,
+        "f": 0.02, "a": 8.348775166283177, "n": 1.2, "vstar_b3": 15.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 15.0,
+        "site_multiplicity": 1.25, "event_strain_increment": "native_cross_slip_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0,
+        "anisotropic_coupling": {
+          "a_nn": 0.10, "a_mm": -0.05, "a_np": 0.05, "a_tc": 0.05
+        }
+      },
+      "zipper_propagation": {
+        "H_eV": 1.95, "S_kB": 0.0, "sigma_c_GPa": 0.02,
+        "f": 0.019230769230769232, "a": 8.409671168144927, "n": 1.2, "vstar_b3": 15.0,
+        "stress_concentration_phi": 1.0, "intrinsic_activation_volume_b3": 15.0,
+        "site_multiplicity": 1.25, "event_strain_increment": "native_cross_slip_swept_area",
+        "attempt_frequency_temperature_exponent": 1.0, "attempt_frequency_reference_temperature_K": 900.0,
+        "eta0_s": 1000000000000.0, "high_hazard_Rdt": 20.0,
+        "anisotropic_coupling": {
+          "a_nn": 0.10, "a_mm": -0.05, "a_np": 0.05, "a_tc": 0.05
+        }
+      }
+    }
+  },
+  "collision": {
+    "replacement_eligible": false,
+    "reason": "core overlap and remesh collision remain deterministic geometry cleanup"
+  }
+}

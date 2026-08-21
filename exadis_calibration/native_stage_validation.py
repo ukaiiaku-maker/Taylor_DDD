@@ -15,6 +15,23 @@ def _load_case(path: Path) -> tuple[dict, np.ndarray, Path]:
     case = path / "audit_enabled" if (path / "audit_enabled").is_dir() else path
     summary = json.loads((case / "final_summary.json").read_text())
     curve = np.atleast_2d(np.loadtxt(case / "stress_strain_dens.dat", comments="#"))
+    if not np.isclose(
+        float(curve[-1, 1]), float(summary["strain"]), rtol=0.0, atol=1.0e-20
+    ):
+        final_row = np.zeros(curve.shape[1], dtype=float)
+        final_row[0] = float(summary["istep"])
+        final_row[1] = float(summary["strain"])
+        final_row[2] = float(summary["stress_Pa"])
+        final_row[3] = float(summary["density_m2"])
+        if curve.shape[1] > 4:
+            final_row[4] = float(summary["Nnodes"])
+        if curve.shape[1] > 5:
+            final_row[5] = float(summary["Nsegs"])
+        if curve.shape[1] > 6:
+            final_row[6] = float(summary["dt_s"])
+        if curve.shape[1] > 7:
+            final_row[7] = float(summary["time_s"])
+        curve = np.vstack((curve, final_row))
     return summary, curve, case / "event_audit.jsonl"
 
 

@@ -51,6 +51,53 @@ def _network_digest(system: Any) -> str:
     return digest.hexdigest()
 
 
+def _network_density_m2(graph: Any, burgers_m: float) -> float:
+    """Compute line density for an ExaDisNet, including periodic images."""
+    data = graph.export_data()
+    cell_data = data["cell"]
+    nodes = np.asarray(data["nodes"]["positions"], dtype=float)
+    nodeids = np.asarray(data["segs"]["nodeids"], dtype=int)
+    if nodeids.size == 0:
+        return 0.0
+    import pyexadis
+
+    cell = pyexadis.Cell(
+        h=cell_data["h"], origin=cell_data["origin"],
+        is_periodic=cell_data["is_periodic"],
+    )
+    r1 = nodes[nodeids[:, 0]]
+    r2 = np.asarray(cell.closest_image(Rref=r1, R=nodes[nodeids[:, 1]]))
+    line_internal = float(np.linalg.norm(r2 - r1, axis=1).sum())
+    volume_internal = float(cell.volume())
+    return line_internal / (volume_internal * burgers_m * burgers_m)
+
+
+def _scale_initial_density(graph: Any, density_factor: float) -> tuple[float, float]:
+    """Uniformly scale cell and nodes so rho_new/rho_old=density_factor."""
+    if not np.isfinite(density_factor) or density_factor <= 0.0:
+        raise ValueError("--density-factor must be finite and positive")
+    before = _network_density_m2(graph, 1.0)
+    if density_factor == 1.0:
+        return before, before
+    data = graph.export_data()
+    scale = density_factor ** -0.5
+    h = np.asarray(data["cell"]["h"], dtype=float)
+    origin = np.asarray(data["cell"]["origin"], dtype=float)
+    center = origin + 0.5 * np.sum(h, axis=0)
+    data["cell"]["h"] = scale * h
+    data["cell"]["origin"] = center + scale * (origin - center)
+    positions = np.asarray(data["nodes"]["positions"], dtype=float)
+    data["nodes"]["positions"] = center + scale * (positions - center)
+    graph.import_data(data)
+    after = _network_density_m2(graph, 1.0)
+    ratio = after / before
+    if not np.isclose(ratio, density_factor, rtol=1.0e-10, atol=0.0):
+        raise RuntimeError(
+            f"initial-density scaling mismatch: requested {density_factor}, got {ratio}"
+        )
+    return before, after
+
+
 def _file_digest(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -156,6 +203,33 @@ def _audit_counts(path: Path) -> tuple[dict[str, int], dict[str, dict[str, int]]
     }
 
 
+def _discrete_audit_metrics(path: Path) -> dict[str, dict[str, Any]]:
+    metrics: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    rdt_max: defaultdict[str, float] = defaultdict(float)
+    if not path.exists():
+        return {}
+    with path.open() as handle:
+        for line in handle:
+            row = json.loads(line)
+            mechanism = str(row.get("mechanism", ""))
+            if mechanism not in {"topology_split", "cross_slip"}:
+                continue
+            metrics[mechanism]["rows"] += 1
+            if row.get("geometry_admissible") == 1:
+                metrics[mechanism]["geometry_admissible"] += 1
+            if row.get("kinetically_eligible") == 1 and float(row.get("H_eV", 0.0)) > 0.0:
+                metrics[mechanism]["kinetic_rows"] += 1
+            if row.get("accepted_arrhenius") == 1:
+                metrics[mechanism]["accepted_arrhenius"] += 1
+            if row.get("deterministic_high_hazard") == 1:
+                metrics[mechanism]["deterministic_high_hazard"] += 1
+            rdt_max[mechanism] = max(rdt_max[mechanism], float(row.get("Rdt", 0.0)))
+    return {
+        mechanism: {**dict(counts), "Rdt_max": rdt_max[mechanism]}
+        for mechanism, counts in sorted(metrics.items())
+    }
+
+
 def _arrhenius_mobility_params(args: argparse.Namespace) -> dict[str, Any]:
     if args.arrhenius_mobility == "off":
         return {}
@@ -185,7 +259,33 @@ def _arrhenius_mobility_params(args: argparse.Namespace) -> dict[str, Any]:
         "a_np": float(coupling.get("a_np", 0.0)),
         "a_other": float(coupling.get("a_other", 0.0)),
     }
-    params["eta0_s"] = args.arrhenius_eta0_default
+    site_multiplicity = float(block.get("site_multiplicity", 1.0))
+    stress_concentration = float(block.get("stress_concentration_phi", 1.0))
+    intrinsic_vstar = float(
+        block.get("intrinsic_activation_volume_b3", block["vstar_b3"])
+    )
+    if site_multiplicity <= 0.0:
+        raise ValueError("Arrhenius mobility site_multiplicity must be positive")
+    if not np.isclose(
+        stress_concentration * intrinsic_vstar, params["vstar_b3"], rtol=1e-12
+    ):
+        raise ValueError(
+            "Arrhenius mobility requires vstar_b3 = "
+            "stress_concentration_phi * intrinsic_activation_volume_b3"
+        )
+    prefactor_exponent = float(
+        block.get("attempt_frequency_temperature_exponent", 0.0)
+    )
+    prefactor_reference = float(
+        block.get("attempt_frequency_reference_temperature_K", 900.0)
+    )
+    if prefactor_reference <= 0.0:
+        raise ValueError("Arrhenius mobility prefactor reference must be positive")
+    params["eta0_s"] = (
+        site_multiplicity
+        * args.arrhenius_eta0_default
+        * (args.arrhenius_temperature_K / prefactor_reference) ** prefactor_exponent
+    )
     if args.arrhenius_mobility == "full":
         for name in ("H_screw_eV", "sigma_c_screw_GPa", "vstar_screw_b3"):
             if block.get(name) is None:
@@ -194,7 +294,89 @@ def _arrhenius_mobility_params(args: argparse.Namespace) -> dict[str, Any]:
     return params
 
 
+def _arrhenius_discrete_params(
+    args: argparse.Namespace, mechanism: str, block: dict[str, Any], seed_offset: int
+) -> Any:
+    import pyexadis
+
+    required = ("H_eV", "S_kB", "sigma_c_GPa", "f", "a", "n", "vstar_b3")
+    missing = [name for name in required if block.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"Arrhenius {mechanism} config is incomplete: {', '.join(missing)}"
+        )
+    coupling = block.get("anisotropic_coupling", {})
+    site_multiplicity = float(block.get("site_multiplicity", 1.0))
+    stress_concentration = float(block.get("stress_concentration_phi", 1.0))
+    intrinsic_vstar = float(
+        block.get("intrinsic_activation_volume_b3", block["vstar_b3"])
+    )
+    effective_vstar = stress_concentration * intrinsic_vstar
+    if site_multiplicity <= 0.0:
+        raise ValueError(f"Arrhenius {mechanism} site_multiplicity must be positive")
+    if not np.isclose(effective_vstar, float(block["vstar_b3"]), rtol=1e-12):
+        raise ValueError(
+            f"Arrhenius {mechanism} requires vstar_b3 = "
+            "stress_concentration_phi * intrinsic_activation_volume_b3"
+        )
+    prefactor_exponent = float(
+        block.get("attempt_frequency_temperature_exponent", 0.0)
+    )
+    prefactor_reference = float(
+        block.get("attempt_frequency_reference_temperature_K", 900.0)
+    )
+    if prefactor_reference <= 0.0:
+        raise ValueError(f"Arrhenius {mechanism} prefactor reference must be positive")
+    eta0_effective = (
+        site_multiplicity
+        * float(block.get("eta0_s", args.arrhenius_eta0_default))
+        * (args.arrhenius_temperature_K / prefactor_reference) ** prefactor_exponent
+    )
+    return pyexadis.Arrhenius_DiscreteEvent_Params(
+        True,
+        float(args.arrhenius_temperature_K),
+        float(block["H_eV"]),
+        float(block["S_kB"]),
+        float(block["sigma_c_GPa"]),
+        float(block["f"]),
+        float(block["a"]),
+        float(block["n"]),
+        eta0_effective,
+        effective_vstar,
+        float(args.burgers),
+        float(coupling.get("a_nn", 0.0)),
+        float(coupling.get("a_mm", 0.0)),
+        float(coupling.get("a_np", 0.0)),
+        float(coupling.get("a_tc", coupling.get("a_other", 0.0))),
+        float(block.get("high_hazard_Rdt", 20.0)),
+        int(block.get("seed", 1469598103934665603 + seed_offset)),
+    )
+
+
+def _arrhenius_event_family(
+    args: argparse.Namespace, family: str, names: tuple[str, ...]
+) -> list[Any]:
+    if args.arrhenius_config_data is None:
+        raise ValueError(f"--arrhenius-{family.replace('_', '-')} requires --arrhenius-config")
+    family_block = args.arrhenius_config_data.get(family)
+    if not isinstance(family_block, dict) or family_block.get("replacement_eligible") is not True:
+        raise ValueError(
+            f"Arrhenius {family} block is not marked replacement_eligible=true"
+        )
+    mechanisms = family_block.get("mechanisms")
+    if not isinstance(mechanisms, dict):
+        raise ValueError(f"Arrhenius {family} block lacks mechanisms")
+    missing = [name for name in names if not isinstance(mechanisms.get(name), dict)]
+    if missing:
+        raise ValueError(f"Arrhenius {family} lacks mechanism blocks: {', '.join(missing)}")
+    return [
+        _arrhenius_discrete_params(args, name, mechanisms[name], index)
+        for index, name in enumerate(names)
+    ]
+
+
 def _build_modules(state: dict[str, Any], net: Any, args: argparse.Namespace):
+    import pyexadis
     from pyexadis_base import (
         CalForce,
         Collision,
@@ -221,15 +403,35 @@ def _build_modules(state: dict[str, Any], net: Any, args: argparse.Namespace):
         state=state, force=force, mobility=mobility,
     )
     collision = Collision(collision_mode="Retroactive", state=state)
+    topology_kwargs: dict[str, Any] = {"force": force, "mobility": mobility}
+    if args.arrhenius_topology == "on":
+        topology_kwargs["arrhenius_events"] = _arrhenius_event_family(
+            args,
+            "topology",
+            (
+                "junction_zip",
+                "junction_unzip",
+                "junction_destruction",
+                "junction_reconfiguration",
+                "forest_depinning_like_release",
+            ),
+        )
     topology = Topology(
-        topology_mode="TopologyParallel", state=state,
-        force=force, mobility=mobility,
+        topology_mode="TopologyParallel", state=state, **topology_kwargs
     )
     remesh = Remesh(remesh_rule="LengthBased", state=state)
-    cross = (
-        CrossSlip(cross_slip_mode="ForceBasedParallel", state=state, force=force)
-        if args.cross_slip else None
-    )
+    cross = None
+    if args.cross_slip or args.arrhenius_cross_slip == "on":
+        cross_kwargs: dict[str, Any] = {"force": force}
+        if args.arrhenius_cross_slip == "on":
+            cross_kwargs["arrhenius_events"] = _arrhenius_event_family(
+                args,
+                "cross_slip",
+                ("plane_change", "zipper_propagation"),
+            )
+        cross = CrossSlip(
+            cross_slip_mode="ForceBasedParallel", state=state, **cross_kwargs
+        )
     return force, mobility, integrator, collision, topology, remesh, cross
 
 
@@ -252,12 +454,24 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
         "minseg": 300.0,
         "rtol": 10.0,
         "rann": 10.0,
-        "nextdt": 1.0e-10,
-        "maxdt": 1.0e-9,
+        "nextdt": min(
+            1.0e-10,
+            args.max_strain / (args.minimum_steps * args.strain_rate)
+            if args.minimum_steps > 0 else 1.0e-10,
+        ),
+        "maxdt": min(
+            1.0e-9,
+            args.max_strain / (args.minimum_steps * args.strain_rate)
+            if args.minimum_steps > 0 else 1.0e-9,
+        ),
     }
 
     graph = ExaDisNet()
     graph.read_paradis(str(args.exadis_data), verbose=False)
+    _base_density_internal, scaled_density_internal = _scale_initial_density(
+        graph, args.density_factor
+    )
+    initial_density_m2 = scaled_density_internal / (args.burgers * args.burgers)
     net = DisNetManager(graph)
     modules = _build_modules(state, net, args)
     force, mobility, integrator, collision, topology, remesh, cross = modules
@@ -315,14 +529,18 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
         driver.disable_audit()
 
     mechanisms, labels = _audit_counts(audit_path)
+    discrete_metrics = _discrete_audit_metrics(audit_path)
     summary = {
         "audit_enabled": audit_enabled,
+        "density_factor": float(args.density_factor),
+        "initial_density_m2": float(initial_density_m2),
         "strain": float(state["strain"]),
         "stress_Pa": float(state["stress"]),
         "pstrain": float(state["pstrain"]),
         "density_m2": float(state["density"]),
         "Nnodes": int(system.number_of_nodes()),
         "Nsegs": int(system.number_of_segs()),
+        "network_sane": bool(system.is_sane()),
         "dt_s": float(state["dt"]),
         "time_s": float(state["time"]),
         "istep": int(state["istep"]),
@@ -335,6 +553,7 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
         "audit_path": str(audit_path) if audit_enabled else None,
         "audit_rows_by_mechanism": mechanisms,
         "candidate_labels_by_mechanism": labels,
+        "arrhenius_discrete_audit": discrete_metrics,
     }
     (outdir / "final_summary.json").write_text(
         json.dumps(_clean(summary), indent=2, sort_keys=True) + "\n"
@@ -345,7 +564,10 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
 def _compare(disabled: dict[str, Any], enabled: dict[str, Any], tolerance: float) -> dict[str, Any]:
     checks: dict[str, Any] = {}
     passed = True
-    for key in ("strain", "stress_Pa", "pstrain", "density_m2", "dt_s", "time_s"):
+    for key in (
+        "strain", "stress_Pa", "pstrain", "initial_density_m2", "density_m2",
+        "density_factor", "dt_s", "time_s",
+    ):
         left = float(disabled[key])
         right = float(enabled[key])
         absolute = abs(right - left)
@@ -384,7 +606,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", type=Path, default=Path("results/exadis_native_audit"))
     parser.add_argument("--max-strain", type=float, default=1.0e-5)
     parser.add_argument("--strain-rate", type=float, default=1.0e3)
+    parser.add_argument(
+        "--minimum-steps", type=int, default=0,
+        help="cap maxdt so the target strain uses at least this many steps",
+    )
     parser.add_argument("--burgers", type=float, default=2.55e-10)
+    parser.add_argument(
+        "--density-factor", type=float, default=1.0,
+        help="target initial line-density factor via uniform geometry scaling",
+    )
     parser.add_argument("--audit-stride", type=int, default=1)
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--output-frequency", type=int, default=2_000_000_000)
@@ -432,9 +662,11 @@ def main() -> int:
             args.arrhenius_temperature_K = float(args.arrhenius_config_data.get("temperature_K", 0.0))
     if args.arrhenius_mobility != "off" and not (args.arrhenius_temperature_K and args.arrhenius_temperature_K > 0.0):
         raise SystemExit("requested Arrhenius mobility requires a positive temperature")
+    if args.minimum_steps < 0:
+        raise SystemExit("--minimum-steps must be nonnegative")
+    if args.strain_rate <= 0.0 or args.max_strain <= 0.0:
+        raise SystemExit("--strain-rate and --max-strain must be positive")
     unsupported = []
-    if args.arrhenius_topology == "on": unsupported.append("topology")
-    if args.arrhenius_cross_slip == "on": unsupported.append("cross_slip")
     if args.arrhenius_collision == "activated-only": unsupported.append("collision")
     if unsupported:
         raise SystemExit(
@@ -483,10 +715,23 @@ def main() -> int:
             "calibration_trace_complete" if comparison is None else
             ("passed" if comparison["passed"] else "failed")
         ),
-        "instrumentation_only": args.arrhenius_mobility == "off",
-        "arrhenius_replacements_connected": args.arrhenius_mobility != "off",
+        "instrumentation_only": (
+            args.arrhenius_mobility == "off"
+            and args.arrhenius_topology == "off"
+            and args.arrhenius_cross_slip == "off"
+        ),
+        "arrhenius_replacements_connected": (
+            args.arrhenius_mobility != "off"
+            or args.arrhenius_topology == "on"
+            or args.arrhenius_cross_slip == "on"
+        ),
         "arrhenius_stage": (
-            "A0_stock" if args.arrhenius_mobility == "off" else "A1_arrhenius_peierls_only"
+            "A3_arrhenius_mobility_topology_cross_slip"
+            if args.arrhenius_cross_slip == "on" else
+            "A2_arrhenius_mobility_topology"
+            if args.arrhenius_topology == "on" else
+            "A0_stock" if args.arrhenius_mobility == "off" else
+            "A1_arrhenius_peierls_only"
         ),
         "repository_sha": _git_sha(args.repo_root),
         "exadis_source_sha": _git_sha(args.exadis_root),
@@ -519,6 +764,16 @@ def main() -> int:
             raise SystemExit(
                 f"native audit did not produce accepted and rejected labels for {mechanism}: {counts}"
             )
+    for requested, mechanism in (
+        (args.arrhenius_topology == "on", "topology_split"),
+        (args.arrhenius_cross_slip == "on", "cross_slip"),
+    ):
+        if requested:
+            metrics = enabled["arrhenius_discrete_audit"].get(mechanism, {})
+            if metrics.get("kinetic_rows", 0) == 0:
+                raise SystemExit(
+                    f"requested Arrhenius {mechanism} produced no audited kinetic rows: {metrics}"
+                )
     return 0
 
 

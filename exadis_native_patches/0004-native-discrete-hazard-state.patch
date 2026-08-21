@@ -1,0 +1,175 @@
+diff --git a/src/arrhenius/discrete_hazard.h b/src/arrhenius/discrete_hazard.h
+new file mode 100644
+index 0000000..17db525
+--- /dev/null
++++ b/src/arrhenius/discrete_hazard.h
+@@ -0,0 +1,168 @@
++/*---------------------------------------------------------------------------
++ * Persistent cumulative-hazard state for native discrete Arrhenius events.
++ *-------------------------------------------------------------------------*/
++
++#pragma once
++#ifndef EXADIS_ARRHENIUS_DISCRETE_HAZARD_H
++#define EXADIS_ARRHENIUS_DISCRETE_HAZARD_H
++
++#include "arrhenius/arrhenius_exp_floor.h"
++
++#include <cmath>
++#include <cstdint>
++#include <unordered_map>
++
++namespace ExaDiS {
++namespace Arrhenius {
++
++struct DiscreteEventParams {
++    bool enabled = false;
++    double temperature_K = -1.0;
++    ExpFloorParams barrier;
++    StressCoupling coupling;
++    double high_hazard_Rdt = 20.0;
++    std::uint64_t seed = 0x6a09e667f3bcc909ULL;
++
++    DiscreteEventParams() = default;
++
++    DiscreteEventParams(bool enabled_, double temperature_K_, double H_eV,
++                        double S_kB, double sigma_c_GPa, double floor_fraction,
++                        double shape_a, double shape_n, double eta0_s,
++                        double vstar_b3, double burgmag_m,
++                        double a_nn=0.0, double a_mm=0.0,
++                        double a_np=0.0, double a_other=0.0,
++                        double high_hazard_Rdt_=20.0,
++                        std::uint64_t seed_=0x6a09e667f3bcc909ULL)
++        : enabled(enabled_), temperature_K(temperature_K_),
++          high_hazard_Rdt(high_hazard_Rdt_), seed(seed_)
++    {
++        barrier.H_eV = H_eV;
++        barrier.S_kB = S_kB;
++        barrier.sigma_c_Pa = sigma_c_GPa * 1.0e9;
++        barrier.floor_fraction = floor_fraction;
++        barrier.shape_a = shape_a;
++        barrier.shape_n = shape_n;
++        barrier.eta0_s = eta0_s;
++        barrier.vstar_m3 = vstar_b3 * burgmag_m * burgmag_m * burgmag_m;
++        coupling.a_nn = a_nn;
++        coupling.a_mm = a_mm;
++        coupling.a_np = a_np;
++        coupling.a_other = a_other;
++    }
++};
++
++struct ResidenceState {
++    long creation_step = 0;
++    long last_update_step = -1;
++    double residence_time_s = 0.0;
++    double accumulated_hazard = 0.0;
++    double threshold = 1.0;
++    std::uint64_t generation = 0;
++};
++
++struct HazardDecision {
++    bool fired = false;
++    bool deterministic_high_hazard = false;
++    double accumulated_before = 0.0;
++    double accumulated_after = 0.0;
++    double threshold = 0.0;
++    double residence_time_s = 0.0;
++};
++
++class ResidenceHazard {
++public:
++    HazardDecision advance(std::uint64_t key, long step, double dt_s,
++                           double Rdt, double high_hazard_Rdt,
++                           std::uint64_t seed)
++    {
++        ResidenceState& state = states_[key];
++        if (state.last_update_step < 0) {
++            state.creation_step = step;
++            state.generation = generations_[key];
++            state.threshold = exponential_threshold(key, state.generation, seed);
++        }
++
++        HazardDecision out;
++        out.accumulated_before = state.accumulated_hazard;
++        out.threshold = state.threshold;
++
++        // A candidate is advanced at most once per ExaDiS step even if a
++        // module is called repeatedly by a wrapper.
++        if (state.last_update_step != step) {
++            state.last_update_step = step;
++            state.residence_time_s += dt_s > 0.0 ? dt_s : 0.0;
++            state.accumulated_hazard += Rdt > 0.0 ? Rdt : 0.0;
++        }
++
++        out.accumulated_after = state.accumulated_hazard;
++        out.residence_time_s = state.residence_time_s;
++        out.deterministic_high_hazard =
++            std::isfinite(high_hazard_Rdt) && high_hazard_Rdt > 0.0 &&
++            Rdt >= high_hazard_Rdt;
++        out.fired = out.deterministic_high_hazard ||
++                    state.accumulated_hazard >= state.threshold;
++        return out;
++    }
++
++    void consume(std::uint64_t key)
++    {
++        renew(key);
++    }
++
++    void discard(std::uint64_t key)
++    {
++        renew(key);
++    }
++
++    std::size_t size() const { return states_.size(); }
++
++private:
++    std::unordered_map<std::uint64_t, ResidenceState> states_;
++    std::unordered_map<std::uint64_t, std::uint64_t> generations_;
++
++    void renew(std::uint64_t key)
++    {
++        const auto state = states_.find(key);
++        if (state != states_.end()) {
++            generations_[key] = state->second.generation + 1;
++            states_.erase(state);
++        }
++    }
++
++    static std::uint64_t splitmix64(std::uint64_t value)
++    {
++        value += 0x9e3779b97f4a7c15ULL;
++        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++        return value ^ (value >> 31);
++    }
++
++    static double exponential_threshold(std::uint64_t key,
++                                        std::uint64_t generation,
++                                        std::uint64_t seed)
++    {
++        const std::uint64_t bits = splitmix64(key ^ seed ^
++            (generation * 0x9e3779b97f4a7c15ULL));
++        // Strictly inside (0,1), using the 53 useful mantissa bits.
++        const double u = (static_cast<double>(bits >> 11) + 0.5) /
++                         9007199254740992.0;
++        return -std::log(u);
++    }
++};
++
++inline std::uint64_t event_key(int domain, int index, int event_class,
++                               int candidate_id)
++{
++    std::uint64_t key = static_cast<std::uint32_t>(domain);
++    key = (key << 32) ^ static_cast<std::uint32_t>(index);
++    key ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(event_class))
++           * 0x9e3779b97f4a7c15ULL;
++    key ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(candidate_id))
++           * 0xbf58476d1ce4e5b9ULL;
++    return key;
++}
++
++} // namespace Arrhenius
++} // namespace ExaDiS
++
++#endif
+

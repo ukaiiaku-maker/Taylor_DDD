@@ -11,6 +11,8 @@ EXADIS_DATA="${EXADIS_DATA:-$EXADIS_ROOT/examples/22_fcc_Cu_15um_1e3/180chains_1
 OUTDIR="${OUTDIR:-results/exadis_native_audit}"
 MAX_STRAIN="${MAX_STRAIN:-1.0e-5}"
 STRAIN_RATE="${STRAIN_RATE:-1.0e3}"
+DENSITY_FACTOR="${DENSITY_FACTOR:-1.0}"
+MINIMUM_STEPS="${MINIMUM_STEPS:-0}"
 AUDIT_STRIDE="${AUDIT_STRIDE:-1}"
 PRINT_FREQ="${PRINT_FREQ:-1}"
 OUTPUT_FREQUENCY="${OUTPUT_FREQUENCY:-2000000000}"
@@ -45,6 +47,8 @@ args=(
   --outdir "$OUTDIR"
   --max-strain "$MAX_STRAIN"
   --strain-rate "$STRAIN_RATE"
+  --density-factor "$DENSITY_FACTOR"
+  --minimum-steps "$MINIMUM_STEPS"
   --audit-stride "$AUDIT_STRIDE"
   --print-freq "$PRINT_FREQ"
   --output-frequency "$OUTPUT_FREQUENCY"
@@ -74,7 +78,7 @@ if [[ -n "$REQUIRE_CANDIDATE_LABELS" ]]; then
   done
 fi
 
-PYTHONPATH="$PYEXADIS_DIR:$EXADIS_PYTHON_DIR:${PYTHONPATH:-}" \
+PYTHONPATH="$EXADIS_PYTHON_DIR:$PYEXADIS_DIR:${PYTHONPATH:-}" \
   "$PYTHON_BIN" exadis_audit/native_event_audit.py "${args[@]}"
 
 echo "native invariance report: $OUTDIR/invariance_summary.json"

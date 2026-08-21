@@ -1,0 +1,1092 @@
+diff --git a/python/exadis_pybind.cpp b/python/exadis_pybind.cpp
+index 3445be1..76e1e19 100644
+--- a/python/exadis_pybind.cpp
++++ b/python/exadis_pybind.cpp
+@@ -789,7 +789,9 @@ void remesh(ExaDisNet& disnet, RemeshBind& remeshbind)
+  *    Cross-slip binding
+  *
+  *-------------------------------------------------------------------------*/
+-CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params, ForceBind& forcebind)
++CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params,
++                             ForceBind& forcebind,
++                             typename CrossSlip::Params csparams)
+ {
+     System* system = make_system(new SerialDisNet(), Crystal(params.crystal), params);
+     
+@@ -799,15 +801,15 @@ CrossSlipBind make_cross_slip(std::string cross_slip_mode, Params& params, Force
+     CrossSlip* crossslip;
+     if (cross_slip_mode == "ForceBasedParallel") {
+         if (forcebind.model == ForceBind::LINE_TENSION_MODEL) {
+-            crossslip = new CrossSlipParallel<ForceType::LINE_TENSION_MODEL>(system, force);
++            crossslip = new CrossSlipParallel<ForceType::LINE_TENSION_MODEL>(system, force, csparams);
+         } else if (forcebind.model == ForceBind::CUTOFF_MODEL) {
+-            crossslip = new CrossSlipParallel<ForceType::CUTOFF_MODEL>(system, force);
++            crossslip = new CrossSlipParallel<ForceType::CUTOFF_MODEL>(system, force, csparams);
+         } else if (forcebind.model == ForceBind::DDD_FFT_MODEL) {
+-            crossslip = new CrossSlipParallel<ForceType::DDD_FFT_MODEL>(system, force);
++            crossslip = new CrossSlipParallel<ForceType::DDD_FFT_MODEL>(system, force, csparams);
+         } else if (forcebind.model == ForceBind::SUBCYCLING_MODEL) {
+-            crossslip = new CrossSlipParallel<ForceType::SUBCYCLING_MODEL>(system, force);
++            crossslip = new CrossSlipParallel<ForceType::SUBCYCLING_MODEL>(system, force, csparams);
+         } else if (forcebind.model == ForceBind::GLOBAL_MODEL) {
+-            crossslip = new CrossSlipParallel<ForceType::GLOBAL_MODEL>(system, force);
++            crossslip = new CrossSlipParallel<ForceType::GLOBAL_MODEL>(system, force, csparams);
+         } else {
+             ExaDiS_fatal("Error: invalid force type for CrossSlipParallel binding\n");
+         }
+@@ -1039,8 +1041,29 @@ PYBIND11_MODULE(pyexadis, m) {
+             p->fstats = fstats; return p;
+         }), py::arg("rgroups"), py::arg("rtolth")=1.0, py::arg("rtolrel")=0.1, py::arg("fstats")="");
+         
++    py::class_<Arrhenius::DiscreteEventParams>(m, "Arrhenius_DiscreteEvent_Params")
++        .def(py::init<bool, double, double, double, double, double, double,
++                      double, double, double, double, double, double, double,
++                      double, double, std::uint64_t>(),
++             py::arg("enabled"), py::arg("temperature_K"), py::arg("H_eV"),
++             py::arg("S_kB"), py::arg("sigma_c_GPa"), py::arg("f"),
++             py::arg("a"), py::arg("n"), py::arg("eta0_s"),
++             py::arg("vstar_b3"), py::arg("burgmag_m"),
++             py::arg("a_nn")=0.0, py::arg("a_mm")=0.0,
++             py::arg("a_np")=0.0, py::arg("a_other")=0.0,
++             py::arg("high_hazard_Rdt")=20.0,
++             py::arg("seed")=0x6a09e667f3bcc909ULL);
++
+     py::class_<Topology::Params>(m, "Topology_Params")
+-        .def(py::init<double>(), py::arg("splitMultiNodeAlpha"));
++        .def(py::init<double>(), py::arg("splitMultiNodeAlpha"))
++        .def(py::init<double,
++                      const std::vector<Arrhenius::DiscreteEventParams>&>(),
++             py::arg("splitMultiNodeAlpha"), py::arg("arrhenius_events"));
++
++    py::class_<CrossSlip::Params>(m, "CrossSlip_Params")
++        .def(py::init<>())
++        .def(py::init<const std::vector<Arrhenius::DiscreteEventParams>&>(),
++             py::arg("arrhenius_events"));
+     
+     py::class_<RemeshSerial::Params>(m, "Remesh_Params")
+         .def(py::init<bool, int>(), py::arg("remove_small_loops"), py::arg("coarsen_mode"));
+@@ -1266,7 +1289,8 @@ PYBIND11_MODULE(pyexadis, m) {
+         .def(py::init<>())
+         .def("handle", &CrossSlipBind::handle, "Handle cross-slip operations of the system");
+     m.def("make_cross_slip", &make_cross_slip, "Instantiate a cross-slip class",
+-          py::arg("cross_slip_mode"), py::arg("params"), py::arg("force"));
++          py::arg("cross_slip_mode"), py::arg("params"), py::arg("force"),
++          py::arg("csparams")=CrossSlip::Params());
+     m.def("handle_cross_slip", &handle_cross_slip, "Wrapper to handle cross-slip operations",
+           py::arg("net"), py::arg("cross_slip"));
+ 
+diff --git a/python/pyexadis_base.py b/python/pyexadis_base.py
+index 068cf61..e4f9e3d 100644
+--- a/python/pyexadis_base.py
++++ b/python/pyexadis_base.py
+@@ -576,7 +576,12 @@ class Topology:
+         if self.topology_mode == 'TopologyParallel' and self.mobility_python is not None:
+             raise TypeError('TopologyParallel requires pyexadis mobility module')
+         
+-        topolparams = pyexadis.Topology_Params(splitMultiNodeAlpha)
++        arrhenius_events = kwargs.get('arrhenius_events', None)
++        topolparams = (
++            pyexadis.Topology_Params(splitMultiNodeAlpha, arrhenius_events)
++            if arrhenius_events is not None else
++            pyexadis.Topology_Params(splitMultiNodeAlpha)
++        )
+         self.topology = pyexadis.make_topology(topology_mode, params=params, topolparams=topolparams,
+                                                force=force, mobility=mobility)
+         
+@@ -620,7 +625,14 @@ class CrossSlip:
+         force_module = get_module_arg('CrossSlip::'+self.cross_slip_mode, kwargs, 'force')
+         force, self.force_python = get_exadis_force(force_module, state, params)
+         
+-        self.cross_slip = pyexadis.make_cross_slip(cross_slip_mode, params=params, force=force)
++        arrhenius_events = kwargs.get('arrhenius_events', None)
++        csparams = (
++            pyexadis.CrossSlip_Params(arrhenius_events)
++            if arrhenius_events is not None else pyexadis.CrossSlip_Params()
++        )
++        self.cross_slip = pyexadis.make_cross_slip(
++            cross_slip_mode, params=params, force=force, csparams=csparams
++        )
+         
+     def Handle(self, N: DisNetManager, state: dict) -> None:
+         G = N.get_disnet(ExaDisNet)
+diff --git a/src/audit/event_audit.cpp b/src/audit/event_audit.cpp
+index d45ac53..b25e004 100644
+--- a/src/audit/event_audit.cpp
++++ b/src/audit/event_audit.cpp
+@@ -210,7 +210,11 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         "\"activation_work_J\":%.17g,\"G_eV\":%.17g,"
+         "\"G_floor_eV\":%.17g,\"G_used_eV\":%.17g,\"R_s\":%.17g,"
+         "\"Rdt\":%.17g,\"P\":%.17g,\"selection_threshold\":%.17g,"
+-        "\"accepted_arrhenius\":%d,"
++        "\"accepted_arrhenius\":%d,\"geometry_admissible\":%d,"
++        "\"kinetically_eligible\":%d,\"deterministic_high_hazard\":%d,"
++        "\"event_count\":%d,\"residence_time_s\":%.17g,"
++        "\"accumulated_hazard_before\":%.17g,"
++        "\"accumulated_hazard_after\":%.17g,"
+         "\"x_dagger_m\":%.17g,\"v_star_m3\":%.17g,"
+         "\"delta_work_J\":%.17g,\"before_power_W\":%.17g,"
+         "\"after_power_W\":%.17g,\"delta_power_W\":%.17g,"
+@@ -227,6 +231,10 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         row.eta0_s, row.activation_work_J, row.G_eV, row.G_floor_eV,
+         row.G_used_eV, row.R_s, row.Rdt, row.probability,
+         row.selection_threshold, row.accepted_arrhenius,
++        row.geometry_admissible, row.kinetically_eligible,
++        row.deterministic_high_hazard, row.event_count,
++        row.residence_time_s, row.accumulated_hazard_before,
++        row.accumulated_hazard_after,
+         row.x_dagger_m, row.v_star_m3,
+         row.delta_work_J, row.before_power_W, row.after_power_W,
+         row.delta_power_W, row.before_energy_J, row.after_energy_J,
+diff --git a/src/audit/event_audit.h b/src/audit/event_audit.h
+index 1e9b264..1d252da 100644
+--- a/src/audit/event_audit.h
++++ b/src/audit/event_audit.h
+@@ -86,6 +86,13 @@ struct EventAuditRecord {
+     double probability = 0.0;
+     double selection_threshold = -1.0;
+     int accepted_arrhenius = -1;
++    int geometry_admissible = -1;
++    int kinetically_eligible = -1;
++    int deterministic_high_hazard = 0;
++    int event_count = 0;
++    double residence_time_s = 0.0;
++    double accumulated_hazard_before = 0.0;
++    double accumulated_hazard_after = 0.0;
+     double x_dagger_m = 0.0;
+     double v_star_m3 = 0.0;
+     double delta_work_J = 0.0;
+diff --git a/src/cross_slip.h b/src/cross_slip.h
+index 146ed37..b6528a8 100644
+--- a/src/cross_slip.h
++++ b/src/cross_slip.h
+@@ -12,6 +12,9 @@
+ #define EXADIS_CROSS_SLIP_H
+ 
+ #include "system.h"
++#include "arrhenius/discrete_hazard.h"
++
++#include <vector>
+ 
+ namespace ExaDiS {
+ 
+@@ -27,6 +30,25 @@ public:
+     virtual void handle(System* system) {}
+     virtual ~CrossSlip() {}
+     virtual const char* name() { return "CrossSlipNone"; }
++
++    enum PhysicalEventClass {
++        PLANE_CHANGE = 0,
++        ZIPPER_PROPAGATION = 1,
++        NUM_PHYSICAL_EVENT_CLASSES = 2
++    };
++
++    struct Params {
++        bool arrhenius_enabled = false;
++        std::vector<Arrhenius::DiscreteEventParams> event;
++        Params() = default;
++        explicit Params(const std::vector<Arrhenius::DiscreteEventParams>& p) :
++            arrhenius_enabled(true), event(p)
++        {
++            if (event.size() != NUM_PHYSICAL_EVENT_CLASSES)
++                ExaDiS_fatal("Error: Arrhenius cross slip requires %d physical event parameter blocks\n",
++                             NUM_PHYSICAL_EVENT_CLASSES);
++        }
++    };
+     
+     
+     /*-----------------------------------------------------------------------
+diff --git a/src/cross_slip_types/cross_slip_parallel.h b/src/cross_slip_types/cross_slip_parallel.h
+index be559b4..e49e3c6 100644
+--- a/src/cross_slip_types/cross_slip_parallel.h
++++ b/src/cross_slip_types/cross_slip_parallel.h
+@@ -29,14 +29,34 @@ template<class F>
+ class CrossSlipParallel : public CrossSlip {
+ private:
+     F* force;
++    typename CrossSlip::Params cross_slip_params;
++    Arrhenius::ResidenceHazard residence_hazard;
+     
+ public:
+-    CrossSlipParallel(System* system, Force* _force)
++    CrossSlipParallel(System* system, Force* _force,
++                      typename CrossSlip::Params params=typename CrossSlip::Params())
+     {
++        cross_slip_params = params;
+         // Check and assign force kernel
+         force = dynamic_cast<F*>(_force);
+         if (force == nullptr)
+             ExaDiS_fatal("Error: inconsistent force type in CrossSlipParallel\n");
++        if (cross_slip_params.arrhenius_enabled) {
++            for (int event_class = 0;
++                 event_class < CrossSlip::NUM_PHYSICAL_EVENT_CLASSES;
++                 ++event_class) {
++                const Arrhenius::DiscreteEventParams& p =
++                    cross_slip_params.event[event_class];
++                if (!p.enabled)
++                    ExaDiS_fatal("Error: missing enabled Arrhenius cross-slip event class %d\n",
++                                 event_class);
++                Arrhenius::validate(p.barrier, p.temperature_K,
++                                    "cross slip discrete event");
++                if (!(std::isfinite(p.high_hazard_Rdt) &&
++                      p.high_hazard_Rdt > 0.0))
++                    ExaDiS_fatal("Error: invalid Arrhenius cross-slip high-hazard threshold\n");
++            }
++        }
+     }
+     
+     /*-----------------------------------------------------------------------
+@@ -47,14 +67,13 @@ public:
+         int type;
+         Vec3 p0, p1;
+         Vec3 plane;
+-#ifdef EXADIS_ENABLE_EVENT_AUDIT
+         int n1, n2, s1, s2;
+         int plane1, plane2, force_plane;
+         int seg1_is_screw, seg2_is_screw, both_segments_screw;
+         Vec3 burg, line, current_plane, fLab, fCrystal;
+         double L1, L2, burgSize;
+         double primary_force, cross_force, force_threshold;
+-#endif
++        int stock_force_eligible;
+     };
+     
+     /*-----------------------------------------------------------------------
+@@ -83,9 +102,13 @@ public:
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+         bool audit_enabled = false;
+ #endif
++        bool arrhenius_enabled = false;
++        bool capture_metadata = false;
+         
+-        FindCrossSlipEvents(System* _system, DeviceDisNet* _net, F* _force) :
+-        system(_system), net(_net), force(_force)
++        FindCrossSlipEvents(System* _system, DeviceDisNet* _net, F* _force,
++                            bool arrhenius_enabled_=false) :
++        system(_system), net(_net), force(_force),
++        arrhenius_enabled(arrhenius_enabled_)
+         {
+             eps = 1e-6;
+             if (system->crystal.type == FCC_CRYSTAL)
+@@ -104,9 +127,11 @@ public:
+             
+             R = system->crystal.R;
+             Rinv = system->crystal.Rinv;
++            capture_metadata = arrhenius_enabled;
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+             audit_enabled = system->event_audit &&
+                             system->event_audit->active(system->event_audit->step());
++            capture_metadata = capture_metadata || audit_enabled;
+ #endif
+         }
+         
+@@ -217,15 +242,14 @@ public:
+             // Flag no event type
+             if (tid == 0) {
+                 events(lid).type = -1;
+-#ifdef EXADIS_ENABLE_EVENT_AUDIT
+-                if (audit_enabled) {
++                if (capture_metadata) {
+                 events(lid).n1 = events(lid).n2 = -1;
+                 events(lid).s1 = events(lid).s2 = -1;
+                 events(lid).plane1 = events(lid).plane2 = events(lid).force_plane = -1;
+                 events(lid).primary_force = events(lid).cross_force = 0.0;
+                 events(lid).force_threshold = 0.0;
++                events(lid).stock_force_eligible = 0;
+                 }
+-#endif
+             }
+             
+             auto nodes = net->get_nodes();
+@@ -357,13 +381,24 @@ public:
+                 plane2 = (fabs(tmp3B[j]) < fabs(tmp3B[plane2])) ? j : plane2;
+                 fplane = (fabs(tmp3C[j]) > fabs(tmp3C[fplane])) ? j : fplane;
+             }
++
++            // In Arrhenius mode force ranking is kinetic, not geometric.
++            // Construct the executable FCC alternate plane first so a low-force
++            // candidate is retained for the cumulative-hazard decision.
++            if (arrhenius_enabled && system->crystal.type == FCC_CRYSTAL) {
++                if (plane1 == plane2)
++                    fplane = 1 - plane1;
++                else if (seg1_is_screw)
++                    fplane = plane2;
++                else if (seg2_is_screw)
++                    fplane = plane1;
++            }
+             
+             // Calculate the new plane in the lab frame
+             Vec3 newplane = cross(burg, glideDirLab[fplane]).normalized();
+ 
+             if (tid == 0) {
+-#ifdef EXADIS_ENABLE_EVENT_AUDIT
+-              if (audit_enabled) {
++              if (capture_metadata) {
+                 CrossSlipEvent& event = events(lid);
+                 event.n1 = n1;
+                 event.n2 = n2;
+@@ -390,12 +425,16 @@ public:
+                 event.primary_force = tmp3C[primary_plane];
+                 event.cross_force = tmp3C[fplane];
+                 event.force_threshold = fnodeThreshold;
++                event.stock_force_eligible =
++                    fabs(event.cross_force) >
++                    (weightFactor * fabs(event.primary_force) + fnodeThreshold);
+               }
+-#endif
+             }
+             
+             if (bothseg_are_screw && (plane1 == plane2) && (plane1 != fplane) &&
+-                (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold))) {
++                (arrhenius_enabled ||
++                 (fabs(tmp3C[fplane]) >
++                  (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold)))) {
+                 
+                 // Both segments are close to screw and the average direction
+                 // is close to screw.
+@@ -512,7 +551,9 @@ public:
+                 }
+             
+             } else if (seg1_is_screw && (plane1 != plane2) && (plane2 == fplane) &&
+-                       (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold))) {
++                       (arrhenius_enabled ||
++                        (fabs(tmp3C[fplane]) >
++                         (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold)))) {
+                 
+                 // Zipper condition met for first segment.  If the first
+                 // neighbor is either not pinned or pinned but already
+@@ -539,7 +580,8 @@ public:
+                     double f1dotplane1 = fabs(dot(newSegForce, glideDirLab[plane1]));
+                     double f1dotplanef = fabs(dot(newSegForce, newplane));
+                     
+-                    if (f1dotplanef < zipperThreshold + f1dotplane1) {
++                    if (!arrhenius_enabled &&
++                        f1dotplanef < zipperThreshold + f1dotplane1) {
+                         return;
+                     }
+                     
+@@ -557,7 +599,9 @@ public:
+                 }
+                 
+             } else if (seg2_is_screw && (plane1 != plane2) && (plane1 == fplane) &&
+-                       (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane2])+fnodeThreshold))) {
++                       (arrhenius_enabled ||
++                        (fabs(tmp3C[fplane]) >
++                         (weightFactor*fabs(tmp3C[plane2])+fnodeThreshold)))) {
+                 
+                 // Zipper condition met for second segment
+                 
+@@ -577,7 +621,8 @@ public:
+                     double f1dotplane2 = fabs(dot(newSegForce, glideDirLab[plane2]));
+                     double f1dotplanef = fabs(dot(newSegForce, newplane));
+ 
+-                    if (f1dotplanef < zipperThreshold + f1dotplane2) {
++                    if (!arrhenius_enabled &&
++                        f1dotplanef < zipperThreshold + f1dotplane2) {
+                         return;
+                     }
+                     
+@@ -612,7 +657,8 @@ public:
+         DeviceDisNet* net = system->get_device_network();
+         
+         // Initialize the FindCrossSlipEvents structure
+-        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(system, net, force);
++        FindCrossSlipEvents* cs = exadis_new<FindCrossSlipEvents>(
++            system, net, force, cross_slip_params.arrhenius_enabled);
+         
+         // Identify nodes attached to screw segments that need
+         // to be considered for a cross-slip event
+@@ -655,12 +701,101 @@ public:
+         // let's avoid making unnecessary memory copies
+         system->net_mngr->set_active(active_net);
+         SerialDisNet* network = system->get_serial_network();
++
++        struct CandidateKinetics {
++            int event_class = -1;
++            bool geometry_admissible = false;
++            Arrhenius::Evaluation evaluation;
++            Arrhenius::HazardDecision decision;
++            Mat33 activation_tensor;
++            double tau_primary_Pa = 0.0;
++            double tau_cross_Pa = 0.0;
++            double tau_schmid_local_Pa = 0.0;
++            double sigma_nn_Pa = 0.0;
++            double sigma_mm_Pa = 0.0;
++            double sigma_np_Pa = 0.0;
++        };
++        std::vector<CandidateKinetics> kinetics(numcsnodes);
++        std::vector<int> kinetic_accept(numcsnodes, 0);
+         
+         std::vector<int> eventflag(numcsnodes, 0);
+         // -1: skip, 0: not executed, 1: done
+         for (int k = 0; k < numcsnodes; k++) {
+             if (h_events(k).type < 0) eventflag[k] = -1;
+         }
++
++        if (cross_slip_params.arrhenius_enabled) {
++            for (int k = 0; k < numcsnodes; ++k) {
++                CrossSlipEvent& event = h_events(k);
++                CandidateKinetics& candidate = kinetics[k];
++                candidate.geometry_admissible = event.type >= 0;
++                if (!candidate.geometry_admissible) continue;
++
++                candidate.event_class = event.type < 2 ?
++                    CrossSlip::PLANE_CHANGE : CrossSlip::ZIPPER_PROPAGATION;
++                const Arrhenius::DiscreteEventParams& p =
++                    cross_slip_params.event[candidate.event_class];
++                const Vec3 slip = event.burg.normalized();
++                const Vec3 n_primary = event.current_plane.normalized();
++                const Vec3 n_cross = event.plane.normalized();
++                const Mat33& sigma = system->extstress;
++                candidate.tau_primary_Pa = dot(slip, sigma * n_primary);
++                candidate.tau_cross_Pa = dot(slip, sigma * n_cross);
++                candidate.sigma_nn_Pa = dot(n_cross, sigma * n_cross);
++                candidate.sigma_mm_Pa = dot(n_primary, sigma * n_primary);
++                candidate.sigma_np_Pa = dot(n_cross, sigma * n_primary);
++
++                const double mean_length = 0.5 * (event.L1 + event.L2);
++                const double force_area = event.burgSize * mean_length;
++                candidate.tau_schmid_local_Pa = force_area > 0.0 ?
++                    (event.cross_force - event.primary_force) / force_area :
++                    candidate.tau_cross_Pa - candidate.tau_primary_Pa;
++
++                Arrhenius::StressComponents components;
++                // The native candidate force contains applied, self, and
++                // interaction stresses. Use its resolved plane difference for
++                // the Schmid work, then add tensorial external non-Schmid work.
++                components.tau_s_Pa = candidate.tau_schmid_local_Pa;
++                components.sigma_nn_Pa = candidate.sigma_nn_Pa;
++                components.sigma_mm_Pa = candidate.sigma_mm_Pa;
++                components.sigma_np_Pa = candidate.sigma_np_Pa;
++                components.sigma_other_Pa =
++                    SIGN(candidate.sigma_nn_Pa) * fabs(candidate.sigma_nn_Pa);
++                const double tau_eff = Arrhenius::effective_stress_Pa(
++                    components, p.coupling);
++                candidate.evaluation = Arrhenius::evaluate(
++                    tau_eff, p.temperature_K, system->realdt, p.barrier);
++
++                const Mat33 shear_cross = 0.5 *
++                    (outer(slip, n_cross) + outer(n_cross, slip));
++                const Mat33 shear_primary = 0.5 *
++                    (outer(slip, n_primary) + outer(n_primary, slip));
++                const Mat33 normal_cross = outer(n_cross, n_cross);
++                const Mat33 normal_primary = outer(n_primary, n_primary);
++                const Mat33 normal_mix = 0.5 *
++                    (outer(n_cross, n_primary) + outer(n_primary, n_cross));
++                candidate.activation_tensor = p.barrier.vstar_m3 *
++                    (shear_cross - shear_primary +
++                     p.coupling.a_nn * normal_cross +
++                     p.coupling.a_mm * normal_primary +
++                     p.coupling.a_np * normal_mix +
++                     p.coupling.a_other * SIGN(candidate.sigma_nn_Pa) *
++                         normal_cross);
++
++                const int node_id = h_csnodes(k);
++                const NodeTag tag = network->nodes[node_id].tag;
++                const std::uint64_t key = Arrhenius::event_key(
++                    tag.domain, tag.index, candidate.event_class, event.type);
++                candidate.decision = residence_hazard.advance(
++                    key, system->simulation_step, system->realdt,
++                    candidate.evaluation.Rdt, p.high_hazard_Rdt, p.seed);
++                if (candidate.decision.fired) {
++                    kinetic_accept[k] = 1;
++                } else {
++                    eventflag[k] = -1;
++                }
++            }
++        }
+         
+         // Start with the zipper events
+         for (int k = 0; k < numcsnodes; k++) {
+@@ -771,6 +906,19 @@ public:
+             update_seg_plane(network, s2, newplane);
+         }
+ 
++        if (cross_slip_params.arrhenius_enabled) {
++            for (int k = 0; k < numcsnodes; ++k) {
++                if (eventflag[k] != 1) continue;
++                const CrossSlipEvent& event = h_events(k);
++                const CandidateKinetics& candidate = kinetics[k];
++                const int node_id = h_csnodes(k);
++                const NodeTag tag = network->nodes[node_id].tag;
++                const std::uint64_t key = Arrhenius::event_key(
++                    tag.domain, tag.index, candidate.event_class, event.type);
++                residence_hazard.consume(key);
++            }
++        }
++
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+         EventAuditRecorder* audit = system->event_audit;
+         if (audit && audit->active(audit->step())) {
+@@ -787,6 +935,10 @@ public:
+                 row.dt_s = system->realdt;
+                 row.mechanism = "cross_slip";
+                 row.stage = "cross_slip_candidate";
++                row.event_class = event.type < 0 ?
++                    "geometry_filter_failure" :
++                    (event.type < 2 ? "cross_slip_plane_change" :
++                                      "cross_slip_zipper_propagation");
+                 row.candidate_id = k;
+                 row.node_id = i;
+                 row.seg_id = event.s1;
+@@ -813,7 +965,52 @@ public:
+                 row.tau_local_Pa = denom > 0.0 ? event.primary_force / denom : 0.0;
+                 row.tau_eff_Pa = denom > 0.0 ?
+                     (event.cross_force - event.primary_force) / denom : 0.0;
+-                row.accepted_stock = eventflag[k] == 1 ? 1 : 0;
++                row.geometry_admissible = event.type >= 0 ? 1 : 0;
++                row.kinetically_eligible = event.type >= 0 ? 1 : 0;
++                row.accepted_stock = cross_slip_params.arrhenius_enabled ?
++                    (event.type >= 0 && event.stock_force_eligible ? 1 : 0) :
++                    (eventflag[k] == 1 ? 1 : 0);
++                row.accepted_arrhenius = cross_slip_params.arrhenius_enabled ?
++                    (eventflag[k] == 1 ? 1 : 0) : -1;
++                if (cross_slip_params.arrhenius_enabled && event.type >= 0) {
++                    const CandidateKinetics& candidate = kinetics[k];
++                    const Arrhenius::DiscreteEventParams& p =
++                        cross_slip_params.event[candidate.event_class];
++                    const Arrhenius::Evaluation& e = candidate.evaluation;
++                    row.temperature_K = p.temperature_K;
++                    row.H_eV = p.barrier.H_eV;
++                    row.S_kB = p.barrier.S_kB;
++                    row.sigma_c_GPa = p.barrier.sigma_c_Pa / 1.0e9;
++                    row.floor_fraction_f = p.barrier.floor_fraction;
++                    row.shape_a = p.barrier.shape_a;
++                    row.shape_n = p.barrier.shape_n;
++                    row.eta0_s = p.barrier.eta0_s;
++                    row.v_star_m3 = p.barrier.vstar_m3;
++                    row.tau_local_Pa = candidate.tau_schmid_local_Pa;
++                    row.tau_eff_Pa = e.tau_eff_Pa;
++                    row.activation_work_J = e.activation_work_J;
++                    row.G_eV = e.G_eV;
++                    row.G_floor_eV = e.G_floor_eV;
++                    row.G_used_eV = e.G_used_eV;
++                    row.R_s = e.rate_s;
++                    row.Rdt = e.Rdt;
++                    row.probability = e.probability;
++                    row.selection_threshold = candidate.decision.threshold;
++                    row.residence_time_s = candidate.decision.residence_time_s;
++                    row.accumulated_hazard_before =
++                        candidate.decision.accumulated_before;
++                    row.accumulated_hazard_after =
++                        candidate.decision.accumulated_after;
++                    row.deterministic_high_hazard =
++                        candidate.decision.deterministic_high_hazard ? 1 : 0;
++                    row.event_count = eventflag[k] == 1 ? 1 : 0;
++                    row.activation_tensor_m3[0] = candidate.activation_tensor.xx();
++                    row.activation_tensor_m3[1] = candidate.activation_tensor.yy();
++                    row.activation_tensor_m3[2] = candidate.activation_tensor.zz();
++                    row.activation_tensor_m3[3] = candidate.activation_tensor.yz();
++                    row.activation_tensor_m3[4] = candidate.activation_tensor.xz();
++                    row.activation_tensor_m3[5] = candidate.activation_tensor.xy();
++                }
+                 row.note = "proposed_event_type=" + std::to_string(event.type) +
+                            ";seg2=" + std::to_string(event.s2) +
+                            ";plane1=" + std::to_string(event.plane1) +
+@@ -825,9 +1022,15 @@ public:
+                            ";primary_force_internal=" + std::to_string(event.primary_force) +
+                            ";cross_force_internal=" + std::to_string(event.cross_force) +
+                            ";stock_force_threshold_internal=" + std::to_string(event.force_threshold) +
+-                           ";selection=" + (eventflag[k] == 1 ? "accepted_stock" :
+-                                              (event.type < 0 ? "rejected_force_geometry" :
+-                                                                "rejected_event_conflict"));
++                           ";local_schmid_Pa=" + std::to_string(
++                               kinetics[k].tau_schmid_local_Pa) +
++                           ";selection=" + (eventflag[k] == 1 ?
++                              (cross_slip_params.arrhenius_enabled ?
++                                  "accepted_arrhenius" : "accepted_stock") :
++                              (event.type < 0 ? "rejected_geometry_filter" :
++                               (cross_slip_params.arrhenius_enabled &&
++                                !kinetic_accept[k] ? "waiting_cumulative_hazard" :
++                                                    "rejected_event_conflict")));
+                 audit->write(row, system);
+             }
+         }
+diff --git a/src/driver.cpp b/src/driver.cpp
+index d56e88a..81f805f 100644
+--- a/src/driver.cpp
++++ b/src/driver.cpp
+@@ -626,6 +626,7 @@ void ExaDiSApp::initialize(Control& ctrl, bool check_modules)
+  *-------------------------------------------------------------------------*/
+ void ExaDiSApp::step(Control& ctrl)
+ {
++    system->simulation_step = istep;
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+     EventAuditRecorder* audit = system->event_audit;
+     if (audit) audit->set_context(istep, tottime, system->realdt);
+diff --git a/src/system.cpp b/src/system.cpp
+index cc9e80d..906caa0 100644
+--- a/src/system.cpp
++++ b/src/system.cpp
+@@ -64,6 +64,7 @@ void System::initialize(Params _params, Crystal _crystal, SerialDisNet *network)
+     dEp.zero();
+     dWp.zero();
+     realdt = 0.0;
++    simulation_step = 0;
+     density = network->dislocation_density(params.burgmag);
+     
+     // Create oprec
+diff --git a/src/system.h b/src/system.h
+index d7a2926..3f39c4f 100644
+--- a/src/system.h
++++ b/src/system.h
+@@ -41,6 +41,7 @@ public:
+     
+     Mat33 extstress;
+     double realdt;
++    long simulation_step;
+     Mat33 dEp, dWp;
+     double density;
+     
+diff --git a/src/topology.h b/src/topology.h
+index e08e5df..41c7e77 100644
+--- a/src/topology.h
++++ b/src/topology.h
+@@ -12,6 +12,9 @@
+ #define EXADIS_TOPOLOGY_H
+ 
+ #include "system.h"
++#include "arrhenius/discrete_hazard.h"
++
++#include <array>
+ 
+ namespace ExaDiS {
+ 
+@@ -28,10 +31,33 @@ public:
+     virtual ~Topology() {}
+     virtual const char* name() { return "TopologyNone"; }
+     
++    enum PhysicalEventClass {
++        JUNCTION_ZIP = 0,
++        JUNCTION_UNZIP = 1,
++        JUNCTION_DESTRUCTION = 2,
++        JUNCTION_RECONFIGURATION = 3,
++        FOREST_DEPINNING_LIKE_RELEASE = 4,
++        NUM_PHYSICAL_EVENT_CLASSES = 5
++    };
++
+     struct Params {
+         double splitMultiNodeAlpha;
+-        Params() { splitMultiNodeAlpha = -1.0; }
+-        Params(double _splitMultiNodeAlpha) : splitMultiNodeAlpha(_splitMultiNodeAlpha) {}
++        bool arrhenius_enabled;
++        std::array<Arrhenius::DiscreteEventParams,
++                   NUM_PHYSICAL_EVENT_CLASSES> event;
++        Params() : splitMultiNodeAlpha(-1.0), arrhenius_enabled(false) {}
++        Params(double _splitMultiNodeAlpha) :
++            splitMultiNodeAlpha(_splitMultiNodeAlpha), arrhenius_enabled(false) {}
++        Params(double _splitMultiNodeAlpha,
++               const std::vector<Arrhenius::DiscreteEventParams>& event_params) :
++            splitMultiNodeAlpha(_splitMultiNodeAlpha), arrhenius_enabled(true)
++        {
++            if (event_params.size() != NUM_PHYSICAL_EVENT_CLASSES)
++                ExaDiS_fatal("Error: Arrhenius topology requires %d physical event parameter blocks\n",
++                             NUM_PHYSICAL_EVENT_CLASSES);
++            for (int i = 0; i < NUM_PHYSICAL_EVENT_CLASSES; ++i)
++                event[i] = event_params[i];
++        }
+     };
+     
+     /*-----------------------------------------------------------------------
+diff --git a/src/topology_types/topology_parallel.h b/src/topology_types/topology_parallel.h
+index abfb746..a19c3de 100644
+--- a/src/topology_types/topology_parallel.h
++++ b/src/topology_types/topology_parallel.h
+@@ -314,6 +314,8 @@ private:
+     SplitMultiNode* smn;
+     double splitMultiNodeAlpha;
+     NeighborList* neilist;
++    typename Topology::Params topology_params;
++    Arrhenius::ResidenceHazard residence_hazard;
+ 
+     static const int MAX_SPLITTABLE_DEGREE = MAX_CONN;
+     T_armset armsets[MAX_SPLITTABLE_DEGREE+1];
+@@ -321,6 +323,7 @@ private:
+ public:
+     TopologyParallel(System* system, Force* _force, Mobility* _mobility, Params params=Params()) 
+     {
++        topology_params = params;
+         // Precompute arms sets splits
+         int numSets, **armSets;
+         for (int nconn = 3; nconn <= MAX_SPLITTABLE_DEGREE; nconn++) {
+@@ -352,6 +355,57 @@ public:
+         mob = mobility->mob;
+         
+         neilist = exadis_new<NeighborList>();
++
++        if (topology_params.arrhenius_enabled) {
++            for (int event_class = 0;
++                 event_class < Topology::NUM_PHYSICAL_EVENT_CLASSES;
++                 ++event_class) {
++                const Arrhenius::DiscreteEventParams& p =
++                    topology_params.event[event_class];
++                if (!p.enabled)
++                    ExaDiS_fatal("Error: missing enabled Arrhenius topology event class %d\n",
++                                 event_class);
++                Arrhenius::validate(p.barrier, p.temperature_K,
++                                    "topology discrete event");
++                if (!(std::isfinite(p.high_hazard_Rdt) &&
++                      p.high_hazard_Rdt > 0.0))
++                    ExaDiS_fatal("Error: invalid Arrhenius topology high-hazard threshold\n");
++            }
++        }
++    }
++
++    static const char* physical_event_class_name(int event_class)
++    {
++        switch (event_class) {
++        case Topology::JUNCTION_ZIP: return "junction_zip";
++        case Topology::JUNCTION_UNZIP: return "junction_unzip";
++        case Topology::JUNCTION_DESTRUCTION: return "junction_destruction";
++        case Topology::JUNCTION_RECONFIGURATION: return "junction_reconfiguration";
++        case Topology::FOREST_DEPINNING_LIKE_RELEASE:
++            return "forest_depinning_like_release";
++        default: return "pure_numerical_split_or_cleanup";
++        }
++    }
++
++    static int classify_physical_split(SerialDisNet* network, int node_id,
++                                       const Vec3& new_burg)
++    {
++        const int nconn = network->conn[node_id].num;
++        int existing_junction_arms = 0;
++        for (int arm = 0; arm < nconn; ++arm) {
++            const Vec3& burg = network->segs[network->conn[node_id].seg[arm]].burg;
++            if (burg.norm2() > 1.01) ++existing_junction_arms;
++        }
++        const bool creates_junction_arm = new_burg.norm2() > 1.01;
++        if (nconn == 3 && existing_junction_arms > 0)
++            return Topology::JUNCTION_UNZIP;
++        if (existing_junction_arms >= 2 && !creates_junction_arm)
++            return Topology::JUNCTION_DESTRUCTION;
++        if (existing_junction_arms > 0 && creates_junction_arm)
++            return Topology::JUNCTION_RECONFIGURATION;
++        if (creates_junction_arm)
++            return Topology::JUNCTION_ZIP;
++        return Topology::FOREST_DEPINNING_LIKE_RELEASE;
+     }
+     
+     /*-----------------------------------------------------------------------
+@@ -379,11 +433,14 @@ public:
+         Kokkos::View<int**, T_memory_shared> splits;
+         Kokkos::View<double**, T_memory_shared> power;
+         Kokkos::View<Vec3**, T_memory_shared> splitpos;
++        Kokkos::View<Vec3*, T_memory_shared> new_burg;
++        Kokkos::View<int*, T_memory_shared> geometry_admissible;
++        bool capture_forces = false;
++        Kokkos::View<Vec3*, T_memory_shared> before_force;
++        Kokkos::View<Vec3**, T_memory_shared> after_force;
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+         bool audit_enabled = false;
+-        Kokkos::View<Vec3*, T_memory_shared> before_force;
+         Kokkos::View<Vec3*, T_memory_shared> before_velocity;
+-        Kokkos::View<Vec3**, T_memory_shared> after_force;
+         Kokkos::View<Vec3**, T_memory_shared> after_velocity;
+ #endif
+ 
+@@ -391,6 +448,7 @@ public:
+                        F* _force, Mob* _mob) : 
+         system(_system), net(_net), force(_force), mob(_mob)
+         {
++            capture_forces = topology->topology_params.arrhenius_enabled;
+             double rann = system->params.rann;
+             splitDist = 2.0*rann + eps;
+             vNoise = (system->realdt > 0.0) ? system->params.rtol / system->realdt : 0.0;
+@@ -398,6 +456,7 @@ public:
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+             audit_enabled = system->event_audit &&
+                             system->event_audit->active(system->event_audit->step());
++            capture_forces = capture_forces || audit_enabled;
+ #endif
+             
+             // Copy precomputed armsets for each split
+@@ -419,6 +478,11 @@ public:
+             
+             int n = lid; // id in the splits array
+             int i = splits(n,0); // node id
++
++            if (tid == 0) {
++                geometry_admissible(n) = 0;
++                new_burg(n) = Vec3(0.0);
++            }
+             
+             int nconn = conn[i].num;
+             
+@@ -438,10 +502,12 @@ public:
+ 
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+             if (audit_enabled && tid == 0) {
+-                before_force(n) = fi;
+                 before_velocity(n) = vi;
+             }
+ #endif
++            if (capture_forces && tid == 0) {
++                before_force(n) = fi;
++            }
+             
+             // Compute power dissipation of the original configuration
+             double powerMax = dot(fi, vi);
+@@ -481,6 +547,7 @@ public:
+             Vec3 bnew(0.0);
+             if (splitnet.newseg >= 0)
+                 bnew = splitnet.segs[s].burg;
++            if (tid == 0) new_burg(n) = bnew;
+             
+             // Recomputed forces with new set of arms
+             Vec3 f0 = force->node_force(system, &splitnet, i, team);
+@@ -602,6 +669,7 @@ public:
+                     if (tid == 0) {
+                         splitpos(n,0) = splitnet.nodes[0].pos;
+                         splitpos(n,1) = splitnet.nodes[1].pos;
++                        geometry_admissible(n) = 1;
+                     }
+                 }
+             }
+@@ -613,12 +681,14 @@ public:
+                 power(n,1) = powerTest;
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+                 if (audit_enabled) {
+-                    after_force(n,0) = f0;
+-                    after_force(n,1) = f1;
+                     after_velocity(n,0) = v0;
+                     after_velocity(n,1) = v1;
+                 }
+ #endif
++                if (capture_forces) {
++                    after_force(n,0) = f0;
++                    after_force(n,1) = f1;
++                }
+             }
+         }
+     };
+@@ -715,11 +785,15 @@ public:
+         // configurations for all nodes in parallel
+         Kokkos::resize(smn->power, numsplits, 2);
+         Kokkos::resize(smn->splitpos, numsplits, 2);
++        Kokkos::resize(smn->new_burg, numsplits);
++        Kokkos::resize(smn->geometry_admissible, numsplits);
++        if (smn->capture_forces) {
++            Kokkos::resize(smn->before_force, numsplits);
++            Kokkos::resize(smn->after_force, numsplits, 2);
++        }
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+         if (smn->audit_enabled) {
+-            Kokkos::resize(smn->before_force, numsplits);
+             Kokkos::resize(smn->before_velocity, numsplits);
+-            Kokkos::resize(smn->after_force, numsplits, 2);
+             Kokkos::resize(smn->after_velocity, numsplits, 2);
+         }
+ #endif
+@@ -737,9 +811,21 @@ public:
+         system->net_mngr->set_active(active_net);
+         SerialDisNet* network = system->get_serial_network();
+ 
++        struct CandidateKinetics {
++            int event_class = -1;
++            bool geometry_admissible = false;
++            bool kinetically_eligible = false;
++            double trial_work_J = 0.0;
++            Arrhenius::Evaluation evaluation;
++            Arrhenius::HazardDecision decision;
++        };
++        std::vector<CandidateKinetics> kinetics(numsplits);
++        std::vector<int> stock_selected(numsplits, 0);
++        std::vector<int> arrhenius_selected(numsplits, 0);
++
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+         auto audit_split_candidates = [&](int begin, int count, int nconn,
+-                                          int accepted_split,
++                                          int executed_split,
+                                           const std::string& selection_note) {
+             EventAuditRecorder* audit = system->event_audit;
+             if (!audit || !audit->active(audit->step())) return;
+@@ -764,7 +850,7 @@ public:
+                 row.stage = "topology_candidate";
+                 row.candidate_id = split_id;
+                 row.node_id = node_id;
+-                if (split_id == accepted_split) {
++                if (split_id == executed_split) {
+                     row.created_node_id = network->Nnodes_local;
+                     row.created_seg_id = network->Nsegs_local;
+                 }
+@@ -795,7 +881,50 @@ public:
+                 row.before_power_W = smn->power(row_id, 0) * power_scale_W;
+                 row.after_power_W = smn->power(row_id, 1) * power_scale_W;
+                 row.delta_power_W = row.after_power_W - row.before_power_W;
+-                row.accepted_stock = (split_id == accepted_split) ? 1 : 0;
++                row.accepted_stock = stock_selected[row_id];
++                row.accepted_arrhenius = topology_params.arrhenius_enabled ?
++                    arrhenius_selected[row_id] : -1;
++                row.geometry_admissible = smn->geometry_admissible(row_id);
++                const CandidateKinetics& candidate = kinetics[row_id];
++                row.kinetically_eligible = candidate.kinetically_eligible ? 1 : 0;
++                const int audited_event_class = candidate.event_class >= 0 ?
++                    candidate.event_class :
++                    (row.geometry_admissible ? classify_physical_split(
++                        network, node_id, smn->new_burg(row_id)) : -1);
++                if (audited_event_class >= 0)
++                    row.event_class = physical_event_class_name(audited_event_class);
++                if (topology_params.arrhenius_enabled && candidate.event_class >= 0) {
++                    const Arrhenius::DiscreteEventParams& p =
++                        topology_params.event[candidate.event_class];
++                    const Arrhenius::Evaluation& e = candidate.evaluation;
++                    row.temperature_K = p.temperature_K;
++                    row.H_eV = p.barrier.H_eV;
++                    row.S_kB = p.barrier.S_kB;
++                    row.sigma_c_GPa = p.barrier.sigma_c_Pa / 1.0e9;
++                    row.floor_fraction_f = p.barrier.floor_fraction;
++                    row.shape_a = p.barrier.shape_a;
++                    row.shape_n = p.barrier.shape_n;
++                    row.eta0_s = p.barrier.eta0_s;
++                    row.v_star_m3 = p.barrier.vstar_m3;
++                    row.activation_work_J = candidate.trial_work_J;
++                    row.delta_work_J = candidate.trial_work_J;
++                    row.tau_eff_Pa = e.tau_eff_Pa;
++                    row.G_eV = e.G_eV;
++                    row.G_floor_eV = e.G_floor_eV;
++                    row.G_used_eV = e.G_used_eV;
++                    row.R_s = e.rate_s;
++                    row.Rdt = e.Rdt;
++                    row.probability = e.probability;
++                    row.selection_threshold = candidate.decision.threshold;
++                    row.residence_time_s = candidate.decision.residence_time_s;
++                    row.accumulated_hazard_before =
++                        candidate.decision.accumulated_before;
++                    row.accumulated_hazard_after =
++                        candidate.decision.accumulated_after;
++                    row.deterministic_high_hazard =
++                        candidate.decision.deterministic_high_hazard ? 1 : 0;
++                    row.event_count = arrhenius_selected[row_id];
++                }
+                 const Vec3 p0 = smn->splitpos(row_id, 0);
+                 const Vec3 p1 = smn->splitpos(row_id, 1);
+                 row.note = "nconn=" + std::to_string(nconn) +
+@@ -804,6 +933,9 @@ public:
+                            std::to_string(p0.y) + "," + std::to_string(p0.z) +
+                            ";split_position1_internal=" + std::to_string(p1.x) + "," +
+                            std::to_string(p1.y) + "," + std::to_string(p1.z) +
++                           ";kinetic_mode=" +
++                           (topology_params.arrhenius_enabled ?
++                                "cumulative_hazard" : "stock_max_power") +
+                            ";stock_selection=" + selection_note;
+                 audit->write(row, system);
+             }
+@@ -841,10 +973,11 @@ public:
+             }
+             
+             double powerMax = smn->power(isplit,0);
+-            
+-            // Select most favorable split for the node
+-            int kmax = -1;
+-            Vec3 p0, p1;
++            const int split_begin = isplit;
++
++            // Preserve the stock maximum-power selection as a reference label.
++            int stock_kmax = -1;
++            Vec3 stock_p0, stock_p1;
+             for (int k = 0; k < nsplit; k++) {
+                 if (splits(isplit,0) != i)
+                     ExaDiS_fatal("Error: inconsistent split list\n");
+@@ -852,16 +985,99 @@ public:
+                 double powerTest = smn->power(isplit,1);
+                 if (powerTest > powerMax && powerTest > 1.0) {
+                     powerMax = powerTest;
+-                    kmax = splits(isplit,1); // split id
+-                    p0 = smn->splitpos(isplit,0);
+-                    p1 = smn->splitpos(isplit,1);
++                    stock_kmax = splits(isplit,1); // split id
++                    stock_p0 = smn->splitpos(isplit,0);
++                    stock_p1 = smn->splitpos(isplit,1);
+                 }
+                 isplit++;
+             }
+ 
++            if (stock_kmax >= 0) {
++                for (int row_id = split_begin; row_id < isplit; ++row_id)
++                    if (splits(row_id,1) == stock_kmax)
++                        stock_selected[row_id] = 1;
++            }
++
++            int kmax = stock_kmax;
++            Vec3 p0 = stock_p0;
++            Vec3 p1 = stock_p1;
++
++            if (topology_params.arrhenius_enabled) {
++                kmax = -1;
++                double best_hazard_score = -1.0;
++                const NodeTag tag = network->nodes[i].tag;
++                const Vec3 original = network->nodes[i].pos;
++                const double work_scale_J =
++                    std::pow(system->params.burgmag, 3);
++
++                for (int row_id = split_begin; row_id < isplit; ++row_id) {
++                    CandidateKinetics& candidate = kinetics[row_id];
++                    candidate.geometry_admissible =
++                        smn->geometry_admissible(row_id) != 0;
++                    if (!candidate.geometry_admissible) continue;
++
++                    candidate.event_class = classify_physical_split(
++                        network, i, smn->new_burg(row_id));
++                    const Arrhenius::DiscreteEventParams& p =
++                        topology_params.event[candidate.event_class];
++                    candidate.kinetically_eligible = p.enabled;
++                    if (!candidate.kinetically_eligible) continue;
++
++                    const Vec3 q0 = network->cell.pbc_position(
++                        original, smn->splitpos(row_id,0));
++                    const Vec3 q1 = network->cell.pbc_position(
++                        original, smn->splitpos(row_id,1));
++                    const Vec3 dx0 = q0 - original;
++                    const Vec3 dx1 = q1 - original;
++                    const Vec3 f_before = smn->before_force(row_id);
++                    const Vec3 f_after0 = smn->after_force(row_id,0);
++                    const Vec3 f_after1 = smn->after_force(row_id,1);
++                    candidate.trial_work_J = 0.5 *
++                        (dot(f_before + f_after0, dx0) +
++                         dot(f_before + f_after1, dx1)) * work_scale_J;
++                    const double tau_eff = candidate.trial_work_J /
++                                           p.barrier.vstar_m3;
++                    candidate.evaluation = Arrhenius::evaluate(
++                        tau_eff, p.temperature_K, system->realdt, p.barrier);
++                    const int split_id = splits(row_id,1);
++                    const std::uint64_t key = Arrhenius::event_key(
++                        tag.domain, tag.index, candidate.event_class, split_id);
++                    candidate.decision = residence_hazard.advance(
++                        key, system->simulation_step, system->realdt,
++                        candidate.evaluation.Rdt, p.high_hazard_Rdt, p.seed);
++
++                    if (candidate.decision.fired) {
++                        const double score = candidate.decision.deterministic_high_hazard ?
++                            candidate.evaluation.Rdt + 1.0e100 :
++                            candidate.decision.accumulated_after /
++                            candidate.decision.threshold;
++                        if (score > best_hazard_score) {
++                            best_hazard_score = score;
++                            kmax = split_id;
++                            p0 = smn->splitpos(row_id,0);
++                            p1 = smn->splitpos(row_id,1);
++                        }
++                    }
++                }
++
++                if (kmax >= 0) {
++                    for (int row_id = split_begin; row_id < isplit; ++row_id) {
++                        CandidateKinetics& candidate = kinetics[row_id];
++                        if (candidate.event_class < 0) continue;
++                        const int split_id = splits(row_id,1);
++                        const std::uint64_t key = Arrhenius::event_key(
++                            tag.domain, tag.index, candidate.event_class, split_id);
++                        if (split_id == kmax) arrhenius_selected[row_id] = 1;
++                        // The node connectivity changes after a split, so all
++                        // competing candidate residence states are invalidated.
++                        residence_hazard.discard(key);
++                    }
++                }
++            }
++
+ #ifdef EXADIS_ENABLE_EVENT_AUDIT
+             audit_split_candidates(isplit-nsplit, nsplit, nconn, kmax,
+-                                   kmax >= 0 ? "accepted_max_power" :
++                                   stock_kmax >= 0 ? "accepted_max_power" :
+                                                "rejected_stock_power_threshold");
+ #endif
+             

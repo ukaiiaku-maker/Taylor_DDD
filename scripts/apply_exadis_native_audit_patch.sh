@@ -16,6 +16,8 @@ else
   patches=(
     "$ROOT_DIR/exadis_native_patches/0001-native-event-audit.patch"
     "$ROOT_DIR/exadis_native_patches/0002-native-arrhenius-exp-floor.patch"
+    "$ROOT_DIR/exadis_native_patches/0003-native-discrete-arrhenius-events.patch"
+    "$ROOT_DIR/exadis_native_patches/0004-native-discrete-hazard-state.patch"
   )
 fi
 for patch in "${patches[@]}"; do
@@ -46,6 +48,18 @@ for patch in "${patches[@]}"; do
       if [[ -f "$EXADIS_ROOT/src/arrhenius/arrhenius_exp_floor.h" ]] &&
          [[ -f "$EXADIS_ROOT/src/mobility_types/mobility_fcc0_arrhenius.h" ]] &&
          grep -q "arrhenius/arrhenius_exp_floor.cpp" "$EXADIS_ROOT/src/CMakeLists.txt"; then
+        patch_present=1
+      fi
+      ;;
+    0003-native-discrete-arrhenius-events.patch)
+      if grep -q "junction_reconfiguration" "$EXADIS_ROOT/src/topology.h" &&
+         grep -q "zipper_propagation" "$EXADIS_ROOT/src/cross_slip.h"; then
+        patch_present=1
+      fi
+      ;;
+    0004-native-discrete-hazard-state.patch)
+      if [[ -f "$EXADIS_ROOT/src/arrhenius/discrete_hazard.h" ]] &&
+         grep -q "class ResidenceHazard" "$EXADIS_ROOT/src/arrhenius/discrete_hazard.h"; then
         patch_present=1
       fi
       ;;

@@ -1,5 +1,9 @@
 # Native ExaDiS Arrhenius staged-conversion report
 
+> Historical A1 report. The physics-forward A2/A3 implementation and its
+> revised acceptance evidence supersede the topology and cross-slip gating
+> conclusions below; see `EXADIS_NATIVE_PHYSICS_FORWARD_STAGE_REPORT.md`.
+
 ## Decision
 
 The native conversion reached and passed A1: stock ExaDiS remains the default,
