@@ -1,172 +1,177 @@
-# ExaDiS event-conjugate audit instrumentation
+# Native ExaDiS event-audit instrumentation
 
-This document records the instrumentation layer added before any Arrhenius/TST
-kinetic replacement is connected.
+## Status
 
-## What is implemented in this branch
+This branch now patches the high-performance C++ ExaDiS driver itself. The
+earlier Python stepping audit remains available for historical comparison, but
+it is not the evidence used by the native invariance gate.
 
-The branch now contains a binding-level audit driver:
+The native patch is instrumentation only:
 
-```text
-exadis_audit/binding_event_audit.py
-scripts/run_exadis_binding_event_audit.sh
-```
+- `EXADIS_ENABLE_EVENT_AUDIT` defaults to `OFF` at compile time.
+- an audit-enabled build still records nothing until `Driver.enable_audit()` is
+  called;
+- the recorder does not evaluate a barrier, draw a random number, change a
+  candidate list, or replace a stock decision;
+- `invariance_summary.json` explicitly records
+  `arrhenius_replacements_connected: false`.
 
-The audit driver uses the stock ExaDiS Python module stack but runs through the
-Python `SimulateNetwork` stepping path rather than `SimulateNetworkPerf`.  This
-is deliberate.  The performance driver executes the stock C++ driver without
-Python callbacks.  The Python stepping path exposes the sequence
+No trained Arrhenius hazard is connected in this branch.
 
-```text
-force -> mobility -> integration -> cross slip -> collision -> topology -> remesh -> response
-```
+## Reproducible source and patch
 
-and permits audit records before and after each module call without changing
-accepted stock mechanics.
-
-## EventAuditRecorder
-
-`EventAuditRecorder` is disabled by default.  The binding-level API is
-
-```python
-from exadis_audit.binding_event_audit import enable_audit
-recorder = enable_audit("event_audit.jsonl", stride=1)
-```
-
-A `None` path leaves the recorder disabled.  Audit rows are JSONL records.  This
-is intentionally separate from the Arrhenius hazard law.  No barrier, rate, or
-probability is used to accept or reject a stock ExaDiS event.
-
-## Mobility-force audit
-
-The audit records one row per segment endpoint after force calculation and after
-mobility calculation.  Rows include
-
-```text
-node id and tag
-segment id and endpoints
-segment length
-Burgers vector
-plane normal
-line direction
-screw-character metric
-nodal force
-projected glide force
-resolved stress inferred from total nodal force
-external PK half-segment glide force
-resolved stress inferred from applied stress
-node velocity
-nodal power and projected glide power
-```
-
-The important label is
-
-```text
-force_decomposition = total_nodal_force_projected_to_each_connected_arm_not_native_per_segment
-```
-
-This is a deliberate safety label.  ExaDiS exposes total nodal force through the
-Python bindings.  The binding-level audit can project that total force onto each
-connected arm, but this is not a native per-segment force decomposition.  A later
-native force-kernel audit is still required before using these forces as
-mechanism-specific `F_event` values in a TST barrier.
-
-## Driver-level before/after module audit
-
-The audited stepping class records state before and after
-
-```text
-calforce
-mobility
-time integration
-cross slip
-collision
-topology
-remesh
-mechanical response update
-```
-
-State rows include step, time, dt, strain, stress, density, node count, segment
-count, plastic strain increment, and plastic spin increment.  Module-delta rows
-record changes in those quantities across each module.
-
-## Topology candidate audit
-
-The binding-level topology audit currently identifies multi-node split
-candidates from network degree.  It records nodes with degree greater than or
-equal to three and their connected segment ids.
-
-It does not yet expose the native `TopologyParallel` trial power table.  The
-source code location for the native hook is `src/topology_types/topology_parallel.h`,
-where `SplitDisNet` trial configurations and force/mobility evaluations are used
-to compare split candidates.  The next native hook must export the before/after
-trial force, velocity, power, and accepted stock decision for each candidate.
-
-## Cross-slip candidate audit
-
-The binding-level cross-slip audit identifies screw-like two-arm nodes and logs
-the current segment planes and screw metric.  It does not yet expose the native
-candidate-plane force projections.
-
-The native source location is `src/cross_slip_types/cross_slip_parallel.h`, where
-ExaDiS identifies screw candidates, candidate planes, nodal force projection, and
-stock cross-slip selection.  The next native hook must export `tau_primary`,
-`tau_cross`, selected plane, rejected planes, and accepted stock event.
-
-## Collision classification audit
-
-The binding-level collision audit records before/after node and segment counts
-around the collision module and labels count-changing events.  It cannot yet
-distinguish core-overlap cleanup from activated collision candidates unless that
-classification is exported from `src/collision_types/collision_retroactive.cpp`.
-
-The native hook must classify each collision as
-
-```text
-deterministic core overlap
-numerical cleanup
-activated candidate reaction
-```
-
-Only the activated category is eligible for Arrhenius replacement.
-
-## Validation run
-
-Run the audit locally from the Taylor_DDD branch:
+The patch is pinned to LLNL ExaDiS commit
+`20ea2e82cdb919581c0611c338a6e46f6ad3f008` and is stored at
+`exadis_native_patches/0001-native-event-audit.patch`.
 
 ```bash
-cd /Users/sdillon/Taylor_DDD
-git switch arrhenius-exadis-strain-hardening
-
-PYTHON_BIN=/Users/sdillon/Taylor_DDD/.venv-opendis/bin/python \
-EXADIS_ROOT=core/exadis \
-MAX_STRAIN=1.0e-5 \
-AUDIT_STRIDE=1 \
-bash scripts/run_exadis_binding_event_audit.sh
+git clone https://github.com/LLNL/ExaDiS core/exadis
+git -C core/exadis checkout 20ea2e82cdb919581c0611c338a6e46f6ad3f008
+bash scripts/apply_exadis_native_audit_patch.sh
+bash scripts/build_exadis_native_audit.sh
 ```
 
-Expected outputs:
+The build helper accepts `PYTHON_BIN`, `BUILD_DIR`, `CMAKE_CXX_COMPILER`,
+`FFTW_INC_DIR`, `FFTW_LIB_DIR`, and `BUILD_JOBS` overrides.
+
+## Native hooks
+
+### Driver stages
+
+The C++ performance driver records before/after state around:
 
 ```text
-results/exadis_binding_event_audit/audit_disabled/final_summary.json
-results/exadis_binding_event_audit/audit_enabled/final_summary.json
-results/exadis_binding_event_audit/audit_enabled/event_audit.jsonl
-results/exadis_binding_event_audit/audit_invariance_summary.json
+force -> mobility -> integration -> plastic strain -> glide-plane reset
+      -> optional cross slip -> collision -> topology -> remesh -> response
 ```
 
-The validation criterion is that audit-enabled and audit-disabled runs give the
-same final strain, stress, density, node count, and segment count within the
-specified tolerance.
+State rows include step, time, real time step, strain, stress, plastic strain,
+density, node/segment counts, applied stress, and plastic strain/spin tensors.
 
-## What is not yet implemented
+### FCC_0 mobility
 
-This branch still does not connect Arrhenius hazards to stock ExaDiS.  It also
-does not yet provide native C++ device-side candidate tables for topology,
-cross-slip, and collision.  Those are required before the Arrhenius model can be
-connected without double counting force, line length, stress amplification, or
-trial-configuration energetics.
+The stock subcycling driver has a zero-force outer mobility call, so the recorder
+arms at integration entry and claims the first native FCC_0 evaluation inside
+that integrator. It mirrors the device network once per audited outer step and
+writes one row for each node/connected-arm pair. Rows contain physical
+segment length, Burgers vector, plane, line direction, screw character, total
+nodal force, native nodal velocity, their glide projections, power, and the
+full applied stress tensor.
 
-The next commit should patch the native ExaDiS source tree so the hidden trial
-candidate data are exported to a host-side audit buffer.  Only after that audit
-is numerically invariant can `ArrheniusMobilityLaw`, `ArrheniusTopology`,
-`ArrheniusCrossSlip`, and activated `ArrheniusCollision` be connected.
+The force label is intentionally conservative:
+
+```text
+force_decomposition=total_nodal_force_projected_to_connected_arm
+```
+
+`tau_local_Pa = F_glide/(b L)` is a diagnostic arm projection. It is not claimed
+to be a universal event-conjugate activation stress. Remaining internal
+subcycling evaluations are not audited, which keeps the call structure intact
+and prevents duplicate multi-gigabyte traces.
+
+### TopologyParallel
+
+Every native split trial is recorded after the stock trial-power table and
+winner are known. Rows contain node and split IDs, arm-set mask, trial positions,
+before/after/delta power in watts, and the stock accepted/rejected decision,
+including neighbor-conflict and power-threshold rejection reasons.
+
+### ForceBasedParallel cross slip
+
+Every screw candidate is recorded after stock conflict resolution. Rows contain
+both segment IDs, neighboring nodes, current and candidate planes, Burgers and
+line directions, segment lengths, nodal force, primary/cross-plane force
+projections, force threshold, diagnostic resolved stresses, proposed event type,
+and the final stock accepted/rejected label.
+
+### CollisionRetroactive
+
+Segment and hinge collision candidates are recorded with closest-point
+fractions, distance, segment IDs, rejection reason, and stock outcome. The
+current native collision implementation is geometric core-overlap handling, so
+every such row carries:
+
+```text
+deterministic_geometry_only = true
+classification = core_overlap_geometry
+not_eligible_for_arrhenius_fit
+```
+
+No activated collision law has been inferred from deterministic cleanup.
+
+## Invariance gates
+
+Run the short candidate-coverage gate:
+
+```bash
+PYTHON_BIN=/path/to/python \
+BUILD_DIR=core/exadis/build-audit \
+bash scripts/run_exadis_native_candidate_smoke.sh
+```
+
+This requires both accepted and rejected labels for `cross_slip`, `collision`,
+and `topology_split`, and compares the audit-off/on final state and full network
+digest.
+
+Run the full stock strain-hardening gate:
+
+```bash
+PYTHON_BIN=/path/to/python \
+BUILD_DIR=core/exadis/build-audit \
+OMP_NUM_THREADS=1 \
+MAX_STRAIN=1.0e-5 \
+bash scripts/run_exadis_native_audit.sh
+```
+
+Outputs are:
+
+```text
+results/exadis_native_audit/audit_disabled/final_summary.json
+results/exadis_native_audit/audit_enabled/final_summary.json
+results/exadis_native_audit/audit_enabled/event_audit.jsonl
+results/exadis_native_audit/invariance_summary.json
+```
+
+The exact reproducibility proof uses one OpenMP worker. Stock ExaDiS repeated
+runs with four workers produced different node counts on this machine because
+parallel candidate ordering is not deterministic; that behavior also occurs
+with audit disabled. It must not be confused with an audit effect. Multi-thread
+statistical equivalence is a separate validation problem.
+
+The current recorder is restricted to serial/rank-0 output. Enabling it on a
+nonzero MPI rank fails explicitly rather than interleaving JSONL records.
+
+### Recorded validation evidence
+
+Using ExaDiS `20ea2e82cdb919581c0611c338a6e46f6ad3f008`, the OpenMP+Serial
+Kokkos backend, one OpenMP worker, and no MPI, the full `1.0e-5` gate passed at
+step 23. Audit-off/on both ended at strain `1.021951400751762e-05`, stress
+`1307390.4867648063 Pa`, plastic strain `1.1768853406074455e-06`, density
+`1.1485301879790017e12 m^-2`, 11,088 nodes, and 11,940 segments. The complete
+node/segment digest was identical:
+
+```text
+c8a04cdfa8b9ee27f09ed910592d54facee2e65fae1915b7a5e3224518617d52
+```
+
+The enabled full trace contains 529,620 FCC_0 mobility rows, 24,798 topology
+split rows, 3,764 deterministic collision rows, and 414 driver stage rows.
+
+The two-step cross-slip coverage gate also passed exactly. It contains 359
+cross-slip candidates (59 accepted, 300 rejected), 2,275 topology candidates
+(122 accepted, 2,153 rejected), and 271 collision candidates (107 accepted,
+164 rejected). Of 31,740 mobility rows, 27,931 have nonzero projected velocity.
+
+## Gate before kinetic replacement
+
+A candidate fit is only a calibrated mechanism surrogate. Real barriers can
+depend on character, stress, temperature, junction character, and other state.
+Native replacement remains blocked until the relevant campaign identifies and
+validates activation enthalpy, activation entropy, effective mechanical-work
+tensor (or reduced `phi V*`), site multiplicity, and event strain increment.
+
+For anisotropic work the fitting path uses `W = sigma:A`, resolving Schmid and
+non-Schmid components from the recorded stress tensor and slip geometry.
+Independent alternatives may be summed in hazard space. Sequential obstacles
+must instead use renewal/residence-time treatment; they must not be represented
+as parallel hazard channels.

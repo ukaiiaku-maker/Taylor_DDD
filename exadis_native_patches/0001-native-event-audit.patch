@@ -1,0 +1,1456 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 02587f1..8ce3e50 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,6 +4,7 @@ option(EXADIS_PYTHON_BINDING "Build ExaDiS python module" ON)
+ option(EXADIS_FFT "Build ExaDiS ForceFFT module" ON)
+ option(EXADIS_FULL_UNIFIED_MEMORY "Maximal use of unified memory" ON)
+ option(EXADIS_USE_COMPUTE_MAPS "Use compute maps instead of atomics" OFF)
++option(EXADIS_ENABLE_EVENT_AUDIT "Compile native event-audit instrumentation" OFF)
+ 
+ option(EXADIS_BUILD_EXAMPLES "Build ExaDiS examples" OFF)
+ option(EXADIS_BUILD_TESTS "Build ExaDiS tests" OFF)
+@@ -129,6 +130,9 @@ endif()
+ if(EXADIS_USE_COMPUTE_MAPS)
+     add_definitions(-DEXADIS_USE_COMPUTE_MAPS)
+ endif()
++if(EXADIS_ENABLE_EVENT_AUDIT)
++    add_definitions(-DEXADIS_ENABLE_EVENT_AUDIT)
++endif()
+ 
+ add_subdirectory(src)
+ 
+diff --git a/python/CMakeLists.txt b/python/CMakeLists.txt
+index 1c0084a..a92ac89 100644
+--- a/python/CMakeLists.txt
++++ b/python/CMakeLists.txt
+@@ -33,6 +33,10 @@ set(SOURCES
+     ${EXADIS_SRC_PATH}/cross_slip_types/cross_slip_serial.cpp
+ )
+ 
++if(EXADIS_ENABLE_EVENT_AUDIT)
++    list(APPEND SOURCES ${EXADIS_SRC_PATH}/audit/event_audit.cpp)
++endif()
++
+ # Generate instantiations of topology parallel class
+ # in individual cpp files to reduce compilation times
+ set(TOPOLOGY_FORCE_TYPES
+@@ -86,4 +90,4 @@ if(NOT "${PYEXADIS_OUTPUT_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
+             COPYONLY
+         )
+     endforeach()
+-endif()
+\ No newline at end of file
++endif()
+diff --git a/python/exadis_pybind.cpp b/python/exadis_pybind.cpp
+index c82aa3c..3445be1 100644
+--- a/python/exadis_pybind.cpp
++++ b/python/exadis_pybind.cpp
+@@ -1288,6 +1288,18 @@ PYBIND11_MODULE(pyexadis, m) {
+           .def("step", &Driver::step, "Execute a simulation step")
+           .def("run", &Driver::run, "Run the simulation")
+           .def("oprec_replay", &Driver::oprec_replay, "Replay the simulation from OpRec files");
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    driver.def("enable_audit", &Driver::enable_audit,
++               "Enable native JSONL event audit output",
++               py::arg("path"), py::arg("stride")=1)
++          .def("disable_audit", &Driver::disable_audit,
++               "Disable native event audit output")
++          .def("audit_enabled", &Driver::audit_enabled,
++               "Return whether native event audit output is enabled");
++    m.attr("NATIVE_EVENT_AUDIT_COMPILED") = py::bool_(true);
++#else
++    m.attr("NATIVE_EVENT_AUDIT_COMPILED") = py::bool_(false);
++#endif
+     // Driver control
+     py::class_<Driver::Control>(driver, "Control")
+         .def(py::init<>())
+diff --git a/python/exadis_pybind.h b/python/exadis_pybind.h
+index a7e8405..40ce681 100644
+--- a/python/exadis_pybind.h
++++ b/python/exadis_pybind.h
+@@ -543,6 +543,7 @@ public:
+         // stress / strain / density
+         state["strain"] = strain;
+         state["stress"] = stress;
++        state["pstrain"] = pstrain;
+         state["density"] = system->density;
+         py::array_t<double> pyEtot(6);
+         ptr = static_cast<double*>(pyEtot.request().ptr);
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d6c1c89..45048c0 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -9,6 +9,10 @@ set(SOURCES
+     utils.cpp
+ )
+ 
++if(EXADIS_ENABLE_EVENT_AUDIT)
++    list(APPEND SOURCES audit/event_audit.cpp)
++endif()
++
+ # Use SHARED library with SYCL
+ # Static libraries can cause device context corruption with SYCL when Kokkos::SharedSpace
+ if(Kokkos_ENABLE_SYCL AND NOT EXADIS_SYCL_USE_STATIC)
+diff --git a/src/audit/event_audit.cpp b/src/audit/event_audit.cpp
+new file mode 100644
+index 0000000..5add736
+--- /dev/null
++++ b/src/audit/event_audit.cpp
+@@ -0,0 +1,416 @@
++#include "event_audit.h"
++
++#include "system.h"
++
++#include <cerrno>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <iomanip>
++#include <sstream>
++#include <stdexcept>
++
++namespace ExaDiS {
++
++namespace {
++
++void write_vec3(std::FILE* fp, const char* key, const double value[3])
++{
++    std::fprintf(fp, ",\"%s\":[%.17g,%.17g,%.17g]", key,
++                 value[0], value[1], value[2]);
++}
++
++void write_vec6(std::FILE* fp, const char* key, const double value[6])
++{
++    std::fprintf(fp, ",\"%s\":[%.17g,%.17g,%.17g,%.17g,%.17g,%.17g]", key,
++                 value[0], value[1], value[2], value[3], value[4], value[5]);
++}
++
++} // namespace
++
++EventAuditRecorder::~EventAuditRecorder()
++{
++    disable();
++}
++
++void EventAuditRecorder::enable(const std::string& path, long stride)
++{
++    disable();
++    if (path.empty())
++        throw std::runtime_error("event audit path must not be empty");
++    if (stride < 1)
++        throw std::runtime_error("event audit stride must be >= 1");
++
++    const std::filesystem::path audit_path(path);
++    if (audit_path.has_parent_path())
++        std::filesystem::create_directories(audit_path.parent_path());
++
++    stream_ = std::fopen(path.c_str(), "w");
++    if (!stream_) {
++        std::ostringstream msg;
++        msg << "cannot open event audit output '" << path << "': "
++            << std::strerror(errno);
++        throw std::runtime_error(msg.str());
++    }
++    config_.path = path;
++    config_.stride = stride;
++    config_.enabled = true;
++    mobility_snapshot_armed_ = false;
++    mobility_snapshot_step_ = -1;
++}
++
++void EventAuditRecorder::disable()
++{
++    if (stream_) {
++        std::fflush(stream_);
++        std::fclose(stream_);
++        stream_ = nullptr;
++    }
++    config_ = EventAuditConfig();
++    mobility_snapshot_armed_ = false;
++    mobility_snapshot_step_ = -1;
++}
++
++bool EventAuditRecorder::active(long step) const
++{
++    return config_.enabled && stream_ && step >= 0 &&
++           (step % config_.stride == 0);
++}
++
++void EventAuditRecorder::set_context(long step, double time_s, double dt_s)
++{
++    step_ = step;
++    time_s_ = time_s;
++    dt_s_ = dt_s;
++}
++
++void EventAuditRecorder::arm_mobility_snapshot()
++{
++    mobility_snapshot_armed_ = active(step_) && mobility_snapshot_step_ != step_;
++}
++
++void EventAuditRecorder::disarm_mobility_snapshot()
++{
++    mobility_snapshot_armed_ = false;
++}
++
++bool EventAuditRecorder::claim_mobility_snapshot()
++{
++    if (!mobility_snapshot_armed_ || !active(step_) || mobility_snapshot_step_ == step_)
++        return false;
++    mobility_snapshot_armed_ = false;
++    mobility_snapshot_step_ = step_;
++    return true;
++}
++
++EventAuditState EventAuditRecorder::capture_state(
++    System* system, double strain, double stress_Pa, double pstrain) const
++{
++    EventAuditState state;
++    state.step = step_;
++    state.time_s = time_s_;
++    state.dt_s = system->realdt;
++    state.strain = strain;
++    state.stress_Pa = stress_Pa;
++    state.pstrain = pstrain;
++    state.density_m2 = system->density;
++    state.nnodes = system->Nnodes_total();
++    state.nsegs = system->Nsegs_total();
++    state.extstress_Pa[0] = system->extstress.xx();
++    state.extstress_Pa[1] = system->extstress.yy();
++    state.extstress_Pa[2] = system->extstress.zz();
++    state.extstress_Pa[3] = system->extstress.yz();
++    state.extstress_Pa[4] = system->extstress.xz();
++    state.extstress_Pa[5] = system->extstress.xy();
++    state.dEp[0] = system->dEp.xx();
++    state.dEp[1] = system->dEp.yy();
++    state.dEp[2] = system->dEp.zz();
++    state.dEp[3] = system->dEp.yz();
++    state.dEp[4] = system->dEp.xz();
++    state.dEp[5] = system->dEp.xy();
++    state.dWp[0] = system->dWp.zy();
++    state.dWp[1] = system->dWp.zx();
++    state.dWp[2] = system->dWp.yx();
++    return state;
++}
++
++std::string EventAuditRecorder::json_escape(const std::string& value)
++{
++    std::ostringstream out;
++    for (unsigned char c : value) {
++        switch (c) {
++        case '"': out << "\\\""; break;
++        case '\\': out << "\\\\"; break;
++        case '\b': out << "\\b"; break;
++        case '\f': out << "\\f"; break;
++        case '\n': out << "\\n"; break;
++        case '\r': out << "\\r"; break;
++        case '\t': out << "\\t"; break;
++        default:
++            if (c < 0x20) {
++                out << "\\u" << std::hex << std::setw(4)
++                    << std::setfill('0') << static_cast<int>(c);
++            } else {
++                out << static_cast<char>(c);
++            }
++        }
++    }
++    return out.str();
++}
++
++void EventAuditRecorder::write(EventAuditRecord row, System* system)
++{
++    if (!active(row.step)) return;
++
++    if (system) {
++        row.applied_stress_Pa[0] = system->extstress.xx();
++        row.applied_stress_Pa[1] = system->extstress.yy();
++        row.applied_stress_Pa[2] = system->extstress.zz();
++        row.applied_stress_Pa[3] = system->extstress.yz();
++        row.applied_stress_Pa[4] = system->extstress.xz();
++        row.applied_stress_Pa[5] = system->extstress.xy();
++    }
++
++    std::fprintf(stream_,
++        "{\"record_type\":\"event\",\"step\":%ld,\"time_s\":%.17g,"
++        "\"dt_s\":%.17g,\"mechanism\":\"%s\",\"stage\":\"%s\","
++        "\"candidate_id\":%d,\"node_id\":%d,\"seg_id\":%d,\"seg2_id\":%d,"
++        "\"created_node_id\":%d,\"created_seg_id\":%d,"
++        "\"n1\":%d,\"n2\":%d,\"L_m\":%.17g",
++        row.step, row.time_s, row.dt_s,
++        json_escape(row.mechanism).c_str(), json_escape(row.stage).c_str(),
++        row.candidate_id, row.node_id, row.seg_id, row.seg2_id,
++        row.created_node_id, row.created_seg_id,
++        row.n1, row.n2, row.L_m);
++    write_vec3(stream_, "burg", row.burg);
++    write_vec3(stream_, "plane", row.plane);
++    write_vec3(stream_, "current_plane", row.current_plane);
++    write_vec3(stream_, "line", row.line);
++    write_vec6(stream_, "applied_stress_Pa", row.applied_stress_Pa);
++    write_vec3(stream_, "force_N", row.force_N);
++    write_vec3(stream_, "velocity_m_s", row.velocity_m_s);
++    write_vec3(stream_, "before_force_N", row.before_force_N);
++    write_vec3(stream_, "before_velocity_m_s", row.before_velocity_m_s);
++    write_vec3(stream_, "after_force0_N", row.after_force0_N);
++    write_vec3(stream_, "after_force1_N", row.after_force1_N);
++    write_vec3(stream_, "after_velocity0_m_s", row.after_velocity0_m_s);
++    write_vec3(stream_, "after_velocity1_m_s", row.after_velocity1_m_s);
++    std::fprintf(stream_,
++        ",\"character_screw_abs\":%.17g,\"force_glide_N\":%.17g,"
++        "\"velocity_glide_m_s\":%.17g,"
++        "\"arm_mobility_internal\":%.17g,"
++        "\"L_over_mobility_internal\":%.17g,\"LtimesB_internal\":%.17g,"
++        "\"tau_local_Pa\":%.17g,\"tau_eff_Pa\":%.17g,"
++        "\"x_dagger_m\":%.17g,\"v_star_m3\":%.17g,"
++        "\"delta_work_J\":%.17g,\"before_power_W\":%.17g,"
++        "\"after_power_W\":%.17g,\"delta_power_W\":%.17g,"
++        "\"before_energy_J\":%.17g,\"after_energy_J\":%.17g,"
++        "\"delta_energy_J\":%.17g,\"accepted_stock\":%d,"
++        "\"deterministic_geometry_only\":%d,"
++        "\"plastic_strain_increment\":%.17g,\"note\":\"%s\"}\n",
++        row.character_screw_abs, row.force_glide_N, row.velocity_glide_m_s,
++        row.arm_mobility_internal, row.L_over_mobility_internal,
++        row.LtimesB_internal,
++        row.tau_local_Pa,
++        row.tau_eff_Pa, row.x_dagger_m, row.v_star_m3,
++        row.delta_work_J, row.before_power_W, row.after_power_W,
++        row.delta_power_W, row.before_energy_J, row.after_energy_J,
++        row.delta_energy_J, row.accepted_stock,
++        row.deterministic_geometry_only, row.plastic_strain_increment,
++        json_escape(row.note).c_str());
++}
++
++void EventAuditRecorder::write_stage(
++    const char* stage, const char* phase, const EventAuditState& state,
++    const EventAuditState* before)
++{
++    if (!active(state.step)) return;
++
++    const double delta_strain = before ? state.strain - before->strain : 0.0;
++    const double delta_stress = before ? state.stress_Pa - before->stress_Pa : 0.0;
++    const double delta_pstrain = before ? state.pstrain - before->pstrain : 0.0;
++    const double delta_density = before ? state.density_m2 - before->density_m2 : 0.0;
++    const int delta_nodes = before ? state.nnodes - before->nnodes : 0;
++    const int delta_segs = before ? state.nsegs - before->nsegs : 0;
++
++    std::fprintf(stream_,
++        "{\"record_type\":\"stage_state\",\"step\":%ld,"
++        "\"time_s\":%.17g,\"dt_s\":%.17g,\"mechanism\":\"driver\","
++        "\"stage\":\"%s\",\"phase\":\"%s\",\"strain\":%.17g,"
++        "\"stress_Pa\":%.17g,\"pstrain\":%.17g,\"density_m2\":%.17g,"
++        "\"Nnodes\":%d,\"Nsegs\":%d,\"delta_strain\":%.17g,"
++        "\"delta_stress_Pa\":%.17g,\"delta_pstrain\":%.17g,"
++        "\"delta_density_m2\":%.17g,\"delta_Nnodes\":%d,"
++        "\"delta_Nsegs\":%d",
++        state.step, state.time_s, state.dt_s, json_escape(stage).c_str(),
++        json_escape(phase).c_str(), state.strain, state.stress_Pa,
++        state.pstrain, state.density_m2, state.nnodes, state.nsegs,
++        delta_strain, delta_stress, delta_pstrain, delta_density,
++        delta_nodes, delta_segs);
++    write_vec6(stream_, "applied_stress_Pa", state.extstress_Pa);
++    write_vec6(stream_, "dEp_6", state.dEp);
++    write_vec3(stream_, "dWp_3", state.dWp);
++    double delta_dEp[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++    double delta_dWp[3] = {0.0, 0.0, 0.0};
++    if (before) {
++        for (int i = 0; i < 6; ++i) delta_dEp[i] = state.dEp[i] - before->dEp[i];
++        for (int i = 0; i < 3; ++i) delta_dWp[i] = state.dWp[i] - before->dWp[i];
++    }
++    write_vec6(stream_, "delta_dEp_6", delta_dEp);
++    write_vec3(stream_, "delta_dWp_3", delta_dWp);
++    std::fprintf(stream_, "}\n");
++}
++
++void EventAuditRecorder::flush()
++{
++    if (stream_) std::fflush(stream_);
++}
++
++void audit_mobility_fcc0(System* system, double Medge, double Mscrew)
++{
++    EventAuditRecorder* audit = system->event_audit;
++    if (!audit || !audit->active(audit->step())) return;
++
++    DeviceDisNet* net = system->get_device_network();
++    auto nodes = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), net->nodes);
++    auto segs = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), net->segs);
++    auto conn = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), net->conn);
++    const Cell cell = net->cell;
++    const double b_m = system->params.burgmag;
++    const double force_scale_N = b_m * b_m;
++    const double velocity_scale_m_s = b_m;
++    const double eps = 1.0e-10;
++
++    for (int i = 0; i < net->Nnodes_local; ++i) {
++        const int nconn = conn(i).num;
++        if (nconn < 1) continue;
++
++        Vec3 norm[3], line_constraint(0.0);
++        int ngc = 0;
++        int nlc = 0;
++        Mat33 P = Mat33().eye();
++        double LtimesB = 0.0;
++        int nonzero = 0;
++        const Vec3 r1 = nodes(i).pos;
++
++        for (int j = 0; j < nconn; ++j) {
++            const int k = conn(i).node[j];
++            const Vec3 r2 = cell.pbc_position(r1, nodes(k).pos);
++            Vec3 dr = r2 - r1;
++            const double L = dr.norm();
++            if (L < eps) continue;
++            ++nonzero;
++            dr = (1.0 / L) * dr;
++            const int s = conn(i).seg[j];
++            const Vec3 burg = conn(i).order[j] * segs(s).burg;
++            const double bmag = burg.norm();
++            const double dangle = bmag > 0.0 ? std::fabs(dot(burg, dr)) / bmag : 0.0;
++            const double mobility = Medge + (Mscrew - Medge) * dangle;
++            if (mobility > 0.0) LtimesB += L / mobility;
++
++            Vec3 plane = segs(s).plane.normalized();
++            const Vec3 crystal_plane = system->crystal.Rinv * plane;
++            Vec3 line(0.0);
++            if ((std::fabs(std::fabs(crystal_plane.x) - std::fabs(crystal_plane.y)) > 1e-4) ||
++                (std::fabs(std::fabs(crystal_plane.y) - std::fabs(crystal_plane.z)) > 1e-4))
++                line = dr;
++            if (ngc < 3) {
++                for (int k2 = 0; k2 < ngc; ++k2)
++                    plane = plane.orthogonalize(norm[k2]);
++                if (plane.norm2() >= 0.05) {
++                    plane = plane.normalized();
++                    P = (Mat33().eye() - outer(plane, plane)) * P;
++                    norm[ngc++] = plane;
++                }
++            }
++            if (nlc < 2) {
++                if (nlc == 1) line = line.orthogonalize(line_constraint);
++                if (line.norm2() >= 0.05) {
++                    line_constraint = line.normalized();
++                    ++nlc;
++                }
++            }
++        }
++
++        LtimesB *= 0.5;
++        if (nonzero > 0) {
++            if (nlc == 1) {
++                P = outer(line_constraint, line_constraint) * P;
++                for (int j = 0; j < ngc; ++j)
++                    if (std::fabs(dot(norm[j], line_constraint)) > 0.05) P.zero();
++            } else if (nlc >= 2) {
++                P.zero();
++            }
++            for (int j = 0; j < 3; ++j)
++                for (int k = 0; k < 3; ++k)
++                    if (std::fabs(P[j][k]) < 1e-10) P[j][k] = 0.0;
++        }
++
++        const Vec3 fi = nodes(i).f;
++        const Vec3 Pfi = P * fi;
++        const Vec3 vi = nodes(i).v;
++
++        for (int j = 0; j < nconn; ++j) {
++            const int k = conn(i).node[j];
++            const int s = conn(i).seg[j];
++            const Vec3 r2 = cell.pbc_position(r1, nodes(k).pos);
++            Vec3 dr = r2 - r1;
++            const double L = dr.norm();
++            if (L < eps) continue;
++            dr = (1.0 / L) * dr;
++            const Vec3 burg = conn(i).order[j] * segs(s).burg;
++            const double bmag = burg.norm();
++            const double dangle = bmag > 0.0 ? std::fabs(dot(burg, dr)) / bmag : 0.0;
++            const double arm_mobility = Medge + (Mscrew - Medge) * dangle;
++            const Vec3 plane = segs(s).plane.normalized();
++            Vec3 glide = cross(plane, dr);
++            if (glide.norm2() > eps) glide = glide.normalized();
++            const double fglide_internal = dot(Pfi, glide);
++            const double L_m = L * b_m;
++            const double bphys = bmag * b_m;
++
++            EventAuditRecord row;
++            row.step = audit->step();
++            row.time_s = audit->time_s();
++            row.dt_s = system->realdt;
++            row.mechanism = "mobility_fcc0";
++            row.stage = "mobility";
++            row.node_id = i;
++            row.seg_id = s;
++            row.n1 = i;
++            row.n2 = k;
++            row.L_m = L_m;
++            row.burg[0] = burg.x * b_m;
++            row.burg[1] = burg.y * b_m;
++            row.burg[2] = burg.z * b_m;
++            row.plane[0] = plane.x;
++            row.plane[1] = plane.y;
++            row.plane[2] = plane.z;
++            row.line[0] = dr.x;
++            row.line[1] = dr.y;
++            row.line[2] = dr.z;
++            row.character_screw_abs = bmag > 0.0 ? std::fabs(dot(burg, dr)) / bmag : 0.0;
++            row.force_N[0] = fi.x * force_scale_N;
++            row.force_N[1] = fi.y * force_scale_N;
++            row.force_N[2] = fi.z * force_scale_N;
++            row.velocity_m_s[0] = vi.x * velocity_scale_m_s;
++            row.velocity_m_s[1] = vi.y * velocity_scale_m_s;
++            row.velocity_m_s[2] = vi.z * velocity_scale_m_s;
++            row.force_glide_N = fglide_internal * force_scale_N;
++            row.velocity_glide_m_s = dot(vi, glide) * velocity_scale_m_s;
++            row.arm_mobility_internal = arm_mobility;
++            row.L_over_mobility_internal = arm_mobility > 0.0 ? L / arm_mobility : 0.0;
++            row.LtimesB_internal = LtimesB;
++            row.tau_local_Pa = (bphys > 0.0 && L_m > 0.0)
++                ? row.force_glide_N / (bphys * L_m) : 0.0;
++            row.before_power_W = dot(fi, vi) * force_scale_N * velocity_scale_m_s;
++            row.after_power_W = dot(Pfi, vi) * force_scale_N * velocity_scale_m_s;
++            row.delta_power_W = row.after_power_W - row.before_power_W;
++            row.note = "force_decomposition=total_nodal_force_projected_to_connected_arm;"
++                       "tau_local_is_diagnostic_Fglide_over_bL_not_event_conjugate";
++            audit->write(row, system);
++        }
++    }
++}
++
++} // namespace ExaDiS
+diff --git a/src/audit/event_audit.h b/src/audit/event_audit.h
+new file mode 100644
+index 0000000..57061a4
+--- /dev/null
++++ b/src/audit/event_audit.h
+@@ -0,0 +1,128 @@
++#pragma once
++#ifndef EXADIS_EVENT_AUDIT_H
++#define EXADIS_EVENT_AUDIT_H
++
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++namespace ExaDiS {
++
++class System;
++
++struct EventAuditConfig {
++    bool enabled = false;
++    long stride = 1;
++    std::string path;
++};
++
++struct EventAuditState {
++    long step = 0;
++    double time_s = 0.0;
++    double dt_s = 0.0;
++    double strain = 0.0;
++    double stress_Pa = 0.0;
++    double pstrain = 0.0;
++    double density_m2 = 0.0;
++    int nnodes = 0;
++    int nsegs = 0;
++    double extstress_Pa[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++    double dEp[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++    double dWp[3] = {0.0, 0.0, 0.0};
++};
++
++struct EventAuditRecord {
++    long step = 0;
++    double time_s = 0.0;
++    double dt_s = 0.0;
++    std::string mechanism;
++    std::string stage;
++    int candidate_id = -1;
++    int node_id = -1;
++    int seg_id = -1;
++    int seg2_id = -1;
++    int created_node_id = -1;
++    int created_seg_id = -1;
++    int n1 = -1;
++    int n2 = -1;
++    double L_m = 0.0;
++    double burg[3] = {0.0, 0.0, 0.0};
++    double plane[3] = {0.0, 0.0, 0.0};
++    double current_plane[3] = {0.0, 0.0, 0.0};
++    double line[3] = {0.0, 0.0, 0.0};
++    double applied_stress_Pa[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
++    double character_screw_abs = 0.0;
++    double force_N[3] = {0.0, 0.0, 0.0};
++    double velocity_m_s[3] = {0.0, 0.0, 0.0};
++    double before_force_N[3] = {0.0, 0.0, 0.0};
++    double before_velocity_m_s[3] = {0.0, 0.0, 0.0};
++    double after_force0_N[3] = {0.0, 0.0, 0.0};
++    double after_force1_N[3] = {0.0, 0.0, 0.0};
++    double after_velocity0_m_s[3] = {0.0, 0.0, 0.0};
++    double after_velocity1_m_s[3] = {0.0, 0.0, 0.0};
++    double force_glide_N = 0.0;
++    double velocity_glide_m_s = 0.0;
++    double arm_mobility_internal = 0.0;
++    double L_over_mobility_internal = 0.0;
++    double LtimesB_internal = 0.0;
++    double tau_local_Pa = 0.0;
++    double tau_eff_Pa = 0.0;
++    double x_dagger_m = 0.0;
++    double v_star_m3 = 0.0;
++    double delta_work_J = 0.0;
++    double before_power_W = 0.0;
++    double after_power_W = 0.0;
++    double delta_power_W = 0.0;
++    double before_energy_J = 0.0;
++    double after_energy_J = 0.0;
++    double delta_energy_J = 0.0;
++    int accepted_stock = -1;
++    int deterministic_geometry_only = 0;
++    double plastic_strain_increment = 0.0;
++    std::string note;
++};
++
++class EventAuditRecorder {
++public:
++    EventAuditRecorder() = default;
++    ~EventAuditRecorder();
++
++    void enable(const std::string& path, long stride = 1);
++    void disable();
++    bool enabled() const { return config_.enabled; }
++    bool active(long step) const;
++    const EventAuditConfig& config() const { return config_; }
++
++    void set_context(long step, double time_s, double dt_s);
++    void arm_mobility_snapshot();
++    void disarm_mobility_snapshot();
++    bool claim_mobility_snapshot();
++    EventAuditState capture_state(System* system, double strain,
++                                  double stress_Pa, double pstrain) const;
++    void write(EventAuditRecord row, System* system = nullptr);
++    void write_stage(const char* stage, const char* phase,
++                     const EventAuditState& state,
++                     const EventAuditState* before = nullptr);
++    void flush();
++
++    long step() const { return step_; }
++    double time_s() const { return time_s_; }
++    double dt_s() const { return dt_s_; }
++
++private:
++    EventAuditConfig config_;
++    std::FILE* stream_ = nullptr;
++    long step_ = 0;
++    double time_s_ = 0.0;
++    double dt_s_ = 0.0;
++    bool mobility_snapshot_armed_ = false;
++    long mobility_snapshot_step_ = -1;
++
++    static std::string json_escape(const std::string& value);
++};
++
++void audit_mobility_fcc0(System* system, double Medge, double Mscrew);
++
++} // namespace ExaDiS
++
++#endif
+diff --git a/src/collision_types/collision_retroactive.cpp b/src/collision_types/collision_retroactive.cpp
+index d341a79..fe4266b 100644
+--- a/src/collision_types/collision_retroactive.cpp
++++ b/src/collision_types/collision_retroactive.cpp
+@@ -1880,6 +1880,13 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+     Kokkos::View<int, T_memory_shared> ncollisions("ncollisions");
+     Kokkos::View<int**, T_memory_shared> collisions("collisions", max_collisions, 2);
+     Kokkos::View<double**, T_memory_shared> Lcollisions("Lcollisions", max_collisions, 2);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    const bool audit_enabled = system->event_audit &&
++                               system->event_audit->active(system->event_audit->step());
++    Kokkos::View<double*, T_memory_shared> Dcollisions;
++    if (audit_enabled)
++        Dcollisions = Kokkos::View<double*, T_memory_shared>("Dcollisions", max_collisions);
++#endif
+     
+     Kokkos::parallel_for(net->Nsegs_local, KOKKOS_LAMBDA(const int& i) {
+         int n1 = segs[i].n1;
+@@ -1946,6 +1953,9 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+                 collisions(idx,1) = k;
+                 Lcollisions(idx,0) = L1;
+                 Lcollisions(idx,1) = L2;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                if (audit_enabled) Dcollisions(idx) = sqrt(MAX(dist2, 0.0));
++#endif
+             }
+         }
+     });
+@@ -1963,6 +1973,35 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+     int nnodes = network->Nnodes_local;
+     int nsegs = network->Nsegs_local;
+     std::vector<int> skipseg(nsegs, 0);
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    auto audit_collision_candidate = [&](int candidate, int accepted,
++                                         const std::string& reason) {
++        EventAuditRecorder* audit = system->event_audit;
++        if (!audit || !audit->active(audit->step())) return;
++        const int s1 = collisions(candidate, 0);
++        const int s2 = collisions(candidate, 1);
++        EventAuditRecord row;
++        row.step = audit->step();
++        row.time_s = audit->time_s();
++        row.dt_s = system->realdt;
++        row.mechanism = "collision";
++        row.stage = "collision_candidate";
++        row.candidate_id = candidate;
++        row.seg_id = s1;
++        row.seg2_id = s2;
++        row.L_m = Dcollisions(candidate) * system->params.burgmag;
++        row.accepted_stock = accepted;
++        row.deterministic_geometry_only = 1;
++        row.note = "classification=core_overlap_geometry;second_seg_id=" +
++                   std::to_string(s2) +
++                   ";closest_fraction_seg1=" + std::to_string(Lcollisions(candidate,0)) +
++                   ";closest_fraction_seg2=" + std::to_string(Lcollisions(candidate,1)) +
++                   ";stock_selection=" + reason +
++                   ";not_eligible_for_arrhenius_fit";
++        audit->write(row, system);
++    };
++#endif
+     
+     // Now execute collisions found in the previous step
+     for (int c = 0; c < ncollisions(); c++) {
+@@ -1970,15 +2009,30 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+         int i = collisions(c,0);
+         int k = collisions(c,1);
+         
+-        if (skipseg[i] || skipseg[k]) continue;
++        if (skipseg[i] || skipseg[k]) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_collision_candidate(c, 0, "rejected_prior_collision_conflict");
++#endif
++            continue;
++        }
+         
+         int n1 = network->segs[i].n1;
+         int n2 = network->segs[i].n2;
+-        if (n1 >= nnodes || n2 >= nnodes) continue;
++        if (n1 >= nnodes || n2 >= nnodes) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_collision_candidate(c, 0, "rejected_invalidated_first_segment");
++#endif
++            continue;
++        }
+         
+         int n3 = network->segs[k].n1;
+         int n4 = network->segs[k].n2;
+-        if (n3 >= nnodes || n4 >= nnodes) continue;
++        if (n3 >= nnodes || n4 >= nnodes) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_collision_candidate(c, 0, "rejected_invalidated_second_segment");
++#endif
++            continue;
++        }
+         
+         Vec3 p1 = network->nodes[n1].pos;
+         Vec3 p2 = network->cell.pbc_position(p1, network->nodes[n2].pos);
+@@ -2063,14 +2117,21 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+         Vec3 d1 = network->nodes[mergenode1].pos - network->cell.pbc_position(network->nodes[mergenode1].pos, newpos);
+         Vec3 d2 = network->nodes[mergenode2].pos - network->cell.pbc_position(network->nodes[mergenode2].pos, newpos);
+         if ((d1.norm2() > 16 * mindist2) && (d2.norm2() > 16 * mindist2)) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_collision_candidate(c, 0, "rejected_merge_displacement_safeguard");
++#endif
+             continue;
+         }
+         
+         // Test for glide plane violations
+         if (system->crystal.enforce_glide_planes) {
+             if (!test_collision_glide_planes(system, network, mergenode1, newpos, coplanar) ||
+-                !test_collision_glide_planes(system, network, mergenode2, newpos, coplanar))
++                !test_collision_glide_planes(system, network, mergenode2, newpos, coplanar)) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                audit_collision_candidate(c, 0, "rejected_glide_plane_constraint");
++#endif
+                 continue;
++            }
+         }
+         
+         /*
+@@ -2108,6 +2169,10 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+         }
+         bool merge_error = network->merge_nodes_position(mergenode1, mergenode2, newpos, system->dEp);
+         nmerge++;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        audit_collision_candidate(c, 1, merge_error ? "accepted_merge_reported_error" :
++                                                    "accepted_deterministic_merge");
++#endif
+         
+         // Attempt to fix glide plane violations that may have been
+         // introduced during the merge operation.
+@@ -2291,6 +2356,32 @@ void CollisionRetroactive::retroactive_collision_parallel(System* system)
+                 }
+                 bool merge_error = network->merge_nodes_position(mergenode1, mergenode2, newpos, system->dEp);
+                 nmerge++;
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                EventAuditRecorder* audit = system->event_audit;
++                if (audit && audit->active(audit->step())) {
++                    EventAuditRecord row;
++                    row.step = audit->step();
++                    row.time_s = audit->time_s();
++                    row.dt_s = system->realdt;
++                    row.mechanism = "collision";
++                    row.stage = "hinge_collision";
++                    row.candidate_id = i * MAX_CONN * MAX_CONN + j * MAX_CONN + k;
++                    row.node_id = i;
++                    row.seg_id = l3;
++                    row.seg2_id = l4;
++                    row.n1 = n3;
++                    row.n2 = n4;
++                    row.accepted_stock = 1;
++                    row.deterministic_geometry_only = 1;
++                    row.note = std::string("classification=core_overlap_geometry;hinge=1;") +
++                               "second_seg_id=" + std::to_string(l4) +
++                               ";triangle=" + std::to_string(tri) +
++                               ";merge_error=" + std::to_string(merge_error) +
++                               ";not_eligible_for_arrhenius_fit";
++                    audit->write(row, system);
++                }
++#endif
+                 
+                 // Attempt to fix glide plane violations that may have been
+                 // introduced during the merge operation.
+diff --git a/src/cross_slip_types/cross_slip_parallel.h b/src/cross_slip_types/cross_slip_parallel.h
+index 8c0b451..be559b4 100644
+--- a/src/cross_slip_types/cross_slip_parallel.h
++++ b/src/cross_slip_types/cross_slip_parallel.h
+@@ -44,9 +44,17 @@ public:
+      *                Structure to hold cross-slip event information.
+      *---------------------------------------------------------------------*/
+     struct CrossSlipEvent {
+-        int type; 
++        int type;
+         Vec3 p0, p1;
+         Vec3 plane;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        int n1, n2, s1, s2;
++        int plane1, plane2, force_plane;
++        int seg1_is_screw, seg2_is_screw, both_segments_screw;
++        Vec3 burg, line, current_plane, fLab, fCrystal;
++        double L1, L2, burgSize;
++        double primary_force, cross_force, force_threshold;
++#endif
+     };
+     
+     /*-----------------------------------------------------------------------
+@@ -72,6 +80,9 @@ public:
+         Kokkos::View<int*, T_memory_shared> count;
+         Kokkos::View<int*, T_memory_space> csnodes;
+         Kokkos::View<CrossSlipEvent*, T_memory_shared> events;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        bool audit_enabled = false;
++#endif
+         
+         FindCrossSlipEvents(System* _system, DeviceDisNet* _net, F* _force) :
+         system(_system), net(_net), force(_force)
+@@ -93,6 +104,10 @@ public:
+             
+             R = system->crystal.R;
+             Rinv = system->crystal.Rinv;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_enabled = system->event_audit &&
++                            system->event_audit->active(system->event_audit->step());
++#endif
+         }
+         
+         KOKKOS_INLINE_FUNCTION
+@@ -200,7 +215,18 @@ public:
+             int i = csnodes(lid); // node id
+             
+             // Flag no event type
+-            if (tid == 0) events(lid).type = -1;
++            if (tid == 0) {
++                events(lid).type = -1;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                if (audit_enabled) {
++                events(lid).n1 = events(lid).n2 = -1;
++                events(lid).s1 = events(lid).s2 = -1;
++                events(lid).plane1 = events(lid).plane2 = events(lid).force_plane = -1;
++                events(lid).primary_force = events(lid).cross_force = 0.0;
++                events(lid).force_threshold = 0.0;
++                }
++#endif
++            }
+             
+             auto nodes = net->get_nodes();
+             auto segs = net->get_segs();
+@@ -334,6 +360,39 @@ public:
+             
+             // Calculate the new plane in the lab frame
+             Vec3 newplane = cross(burg, glideDirLab[fplane]).normalized();
++
++            if (tid == 0) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++              if (audit_enabled) {
++                CrossSlipEvent& event = events(lid);
++                event.n1 = n1;
++                event.n2 = n2;
++                event.s1 = s1;
++                event.s2 = s2;
++                event.plane1 = plane1;
++                event.plane2 = plane2;
++                event.force_plane = fplane;
++                event.seg1_is_screw = seg1_is_screw;
++                event.seg2_is_screw = seg2_is_screw;
++                event.both_segments_screw = bothseg_are_screw;
++                event.burg = burgSize * burg;
++                event.line = vec1.normalized();
++                event.plane = newplane;
++                event.current_plane = segs[s1].plane.normalized();
++                event.fLab = fLab;
++                event.fCrystal = fCrystal;
++                event.L1 = L1;
++                event.L2 = L2;
++                event.burgSize = burgSize;
++                const int primary_plane = (plane1 == plane2) ? plane1 :
++                                          (fabs(tmp3C[plane1]) >= fabs(tmp3C[plane2]) ?
++                                           plane1 : plane2);
++                event.primary_force = tmp3C[primary_plane];
++                event.cross_force = tmp3C[fplane];
++                event.force_threshold = fnodeThreshold;
++              }
++#endif
++            }
+             
+             if (bothseg_are_screw && (plane1 == plane2) && (plane1 != fplane) &&
+                 (fabs(tmp3C[fplane]) > (weightFactor*fabs(tmp3C[plane1])+fnodeThreshold))) {
+@@ -711,6 +770,68 @@ public:
+             update_seg_plane(network, s1, newplane);
+             update_seg_plane(network, s2, newplane);
+         }
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        EventAuditRecorder* audit = system->event_audit;
++        if (audit && audit->active(audit->step())) {
++            const double b_m = system->params.burgmag;
++            const double force_scale_N = b_m * b_m;
++            for (int k = 0; k < numcsnodes; ++k) {
++                const int i = h_csnodes(k);
++                const CrossSlipEvent& event = h_events(k);
++                const double mean_length = 0.5 * (event.L1 + event.L2);
++                const double denom = event.burgSize * mean_length;
++                EventAuditRecord row;
++                row.step = audit->step();
++                row.time_s = audit->time_s();
++                row.dt_s = system->realdt;
++                row.mechanism = "cross_slip";
++                row.stage = "cross_slip_candidate";
++                row.candidate_id = k;
++                row.node_id = i;
++                row.seg_id = event.s1;
++                row.seg2_id = event.s2;
++                row.n1 = event.n1;
++                row.n2 = event.n2;
++                row.L_m = mean_length * b_m;
++                row.burg[0] = event.burg.x * b_m;
++                row.burg[1] = event.burg.y * b_m;
++                row.burg[2] = event.burg.z * b_m;
++                row.plane[0] = event.plane.x;
++                row.plane[1] = event.plane.y;
++                row.plane[2] = event.plane.z;
++                row.current_plane[0] = event.current_plane.x;
++                row.current_plane[1] = event.current_plane.y;
++                row.current_plane[2] = event.current_plane.z;
++                row.line[0] = event.line.x;
++                row.line[1] = event.line.y;
++                row.line[2] = event.line.z;
++                row.force_N[0] = event.fLab.x * force_scale_N;
++                row.force_N[1] = event.fLab.y * force_scale_N;
++                row.force_N[2] = event.fLab.z * force_scale_N;
++                row.force_glide_N = event.cross_force * force_scale_N;
++                row.tau_local_Pa = denom > 0.0 ? event.primary_force / denom : 0.0;
++                row.tau_eff_Pa = denom > 0.0 ?
++                    (event.cross_force - event.primary_force) / denom : 0.0;
++                row.accepted_stock = eventflag[k] == 1 ? 1 : 0;
++                row.note = "proposed_event_type=" + std::to_string(event.type) +
++                           ";seg2=" + std::to_string(event.s2) +
++                           ";plane1=" + std::to_string(event.plane1) +
++                           ";plane2=" + std::to_string(event.plane2) +
++                           ";force_plane=" + std::to_string(event.force_plane) +
++                           ";seg1_is_screw=" + std::to_string(event.seg1_is_screw) +
++                           ";seg2_is_screw=" + std::to_string(event.seg2_is_screw) +
++                           ";both_segments_screw=" + std::to_string(event.both_segments_screw) +
++                           ";primary_force_internal=" + std::to_string(event.primary_force) +
++                           ";cross_force_internal=" + std::to_string(event.cross_force) +
++                           ";stock_force_threshold_internal=" + std::to_string(event.force_threshold) +
++                           ";selection=" + (eventflag[k] == 1 ? "accepted_stock" :
++                                              (event.type < 0 ? "rejected_force_geometry" :
++                                                                "rejected_event_conflict"));
++                audit->write(row, system);
++            }
++        }
++#endif
+         
+         
+         if (cutoff > 0.0)
+diff --git a/src/driver.cpp b/src/driver.cpp
+index 1728038..d56e88a 100644
+--- a/src/driver.cpp
++++ b/src/driver.cpp
+@@ -626,40 +626,125 @@ void ExaDiSApp::initialize(Control& ctrl, bool check_modules)
+  *-------------------------------------------------------------------------*/
+ void ExaDiSApp::step(Control& ctrl)
+ {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditRecorder* audit = system->event_audit;
++    if (audit) audit->set_context(istep, tottime, system->realdt);
++    auto audit_begin = [&](const char* stage) {
++        EventAuditState state;
++        if (audit && audit->active(istep)) {
++            audit->set_context(istep, tottime, system->realdt);
++            state = audit->capture_state(system, strain, stress, pstrain);
++            audit->write_stage(stage, "before", state);
++        }
++        return state;
++    };
++    auto audit_end = [&](const char* stage, const EventAuditState& before) {
++        if (audit && audit->active(istep)) {
++            audit->set_context(istep, tottime, system->realdt);
++            EventAuditState after = audit->capture_state(system, strain, stress, pstrain);
++            audit->write_stage(stage, "after", after, &before);
++        }
++    };
++#endif
++
+     // Do some force pre-computation for the step if needed
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_force = audit_begin("force");
++#endif
+     force->pre_compute(system);
+-    
++
+     // Nodal force calculation
+     force->compute(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("force", audit_force);
++#endif
+     
+     // Mobility calculation
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_mobility_state = audit_begin("mobility");
++#endif
+     mobility->compute(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("mobility", audit_mobility_state);
++#endif
+     
+     // Time-integration
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_integrator = audit_begin("integrator");
++    if (audit && audit->active(istep)) audit->arm_mobility_snapshot();
++#endif
+     integrator->integrate(system);
+     oprec_save_integration(ctrl);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    if (audit) audit->disarm_mobility_snapshot();
++    audit_end("integrator", audit_integrator);
++#endif
+     
+     // Compute plastic strain
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_plastic_strain = audit_begin("plastic_strain");
++#endif
+     system->plastic_strain();
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("plastic_strain", audit_plastic_strain);
++#endif
+     
+     // Reset glide planes
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_glide_planes = audit_begin("glide_plane_reset");
++#endif
+     system->reset_glide_planes();
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("glide_plane_reset", audit_glide_planes);
++#endif
+     
+     // Cross-slip
+-    if (crossslip)
++    if (crossslip) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        EventAuditState audit_cross_slip = audit_begin("cross_slip");
++#endif
+         crossslip->handle(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        audit_end("cross_slip", audit_cross_slip);
++#endif
++    }
+     
+     // Collision
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_collision = audit_begin("collision");
++#endif
+     collision->handle(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("collision", audit_collision);
++#endif
+     
+     // Topology
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_topology = audit_begin("topology");
++#endif
+     topology->handle(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("topology", audit_topology);
++#endif
+     
+     // Remesh
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_remesh = audit_begin("remesh");
++#endif
+     remesh->remesh(system);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("remesh", audit_remesh);
++#endif
+     
+     // Update stress
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditState audit_response = audit_begin("response_update");
++#endif
+     update_mechanics(ctrl);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    audit_end("response_update", audit_response);
++    if (audit && audit->active(istep)) audit->flush();
++#endif
+     
+     // Output
+     output(ctrl);
+diff --git a/src/driver.h b/src/driver.h
+index e32a2f6..6d644d8 100644
+--- a/src/driver.h
++++ b/src/driver.h
+@@ -137,6 +137,15 @@ public:
+     
+     virtual void write_restart(std::string restartfile);
+     virtual void read_restart(std::string restartfile);
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    void enable_audit(const std::string& path, long stride=1) {
++        if (!system) ExaDiS_fatal("Cannot enable audit before setting the ExaDiS system\n");
++        system->enable_event_audit(path, stride);
++    }
++    void disable_audit() { if (system) system->disable_event_audit(); }
++    bool audit_enabled() const { return system && system->event_audit_enabled(); }
++#endif
+     
+     double von_mises(const Mat33 &T) {
+         Mat33 Tdev = T - 1.0/3.0*T.trace()*Mat33().eye();
+diff --git a/src/mobility.h b/src/mobility.h
+index 5efddc9..7d7f635 100644
+--- a/src/mobility.h
++++ b/src/mobility.h
+@@ -15,6 +15,9 @@
+ 
+ namespace ExaDiS {
+ 
++template<class M>
++inline void audit_mobility(System*, M*) {}
++
+ /*---------------------------------------------------------------------------
+  *
+  *    Class:        Mobility
+@@ -27,6 +30,9 @@ public:
+     Mobility(System *system) {}
+     virtual void compute(System *system) = 0;
+     virtual Vec3 node_velocity(System *system, const int &i, const Vec3 &fi) = 0;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    virtual void audit(System*) {}
++#endif
+     virtual ~Mobility() {}
+     virtual const char* name() { return "MobilityNone"; }
+ };
+@@ -76,7 +82,17 @@ public:
+         
+         Kokkos::fence();
+         system->timer[system->TIMER_MOBILITY].stop();
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        audit_mobility(system, mob);
++#endif
+     }
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    void audit(System* system) override {
++        audit_mobility(system, mob);
++    }
++#endif
+     
+     Vec3 node_velocity(System *system, const int &i, const Vec3 &fi)
+     {
+diff --git a/src/mobility_types/mobility_fcc0.h b/src/mobility_types/mobility_fcc0.h
+index 251f8c6..559a0dd 100644
+--- a/src/mobility_types/mobility_fcc0.h
++++ b/src/mobility_types/mobility_fcc0.h
+@@ -167,6 +167,15 @@ struct MobilityFCC0
+     static constexpr const char* name = "MobilityFCC0";
+ };
+ 
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++inline void audit_mobility(System* system, MobilityFCC0* mob)
++{
++    if (system->event_audit &&
++        system->event_audit->claim_mobility_snapshot())
++        audit_mobility_fcc0(system, mob->Medge, mob->Mscrew);
++}
++#endif
++
+ namespace MobilityType {
+     typedef MobilityLocal<MobilityFCC0> FCC_0;
+ }
+diff --git a/src/system.cpp b/src/system.cpp
+index e102aa4..cc9e80d 100644
+--- a/src/system.cpp
++++ b/src/system.cpp
+@@ -29,6 +29,9 @@ System::System()
+ #endif
+ 
+     net_mngr = nullptr;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    event_audit = nullptr;
++#endif
+ }
+ 
+ /*---------------------------------------------------------------------------
+@@ -79,11 +82,34 @@ void System::initialize(Params _params, Crystal _crystal, SerialDisNet *network)
+  *-------------------------------------------------------------------------*/
+ System::~System()
+ {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    if (event_audit) delete event_audit;
++#endif
+     exadis_delete(net_mngr);
+     if (oprec) delete oprec;
+     if (flog) fclose(flog);
+ }
+ 
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++void System::enable_event_audit(const std::string& path, long stride)
++{
++    if (proc_rank != 0)
++        ExaDiS_fatal("Native event audit currently supports serial/rank-0 output only\n");
++    if (!event_audit) event_audit = new EventAuditRecorder();
++    event_audit->enable(path, stride);
++}
++
++void System::disable_event_audit()
++{
++    if (event_audit) event_audit->disable();
++}
++
++bool System::event_audit_enabled() const
++{
++    return event_audit && event_audit->enabled();
++}
++#endif
++
+ /*---------------------------------------------------------------------------
+  *
+  *    Function:     System::register_neighbor_cutoff()
+diff --git a/src/system.h b/src/system.h
+index bbaf0f5..d7a2926 100644
+--- a/src/system.h
++++ b/src/system.h
+@@ -11,6 +11,9 @@
+ #include "crystal.h"
+ #include "params.h"
+ #include "oprec.h"
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++#include "audit/event_audit.h"
++#endif
+ 
+ #pragma once
+ #ifndef EXADIS_SYSTEM_H
+@@ -54,6 +57,13 @@ public:
+     void write_config(std::string filename);
+     
+     OpRec* oprec = nullptr;
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++    EventAuditRecorder* event_audit = nullptr;
++    void enable_event_audit(const std::string& path, long stride=1);
++    void disable_event_audit();
++    bool event_audit_enabled() const;
++#endif
+     
+     int num_ranks;
+     int proc_rank;
+diff --git a/src/topology_types/topology_parallel.h b/src/topology_types/topology_parallel.h
+index d08252b..abfb746 100644
+--- a/src/topology_types/topology_parallel.h
++++ b/src/topology_types/topology_parallel.h
+@@ -379,6 +379,13 @@ public:
+         Kokkos::View<int**, T_memory_shared> splits;
+         Kokkos::View<double**, T_memory_shared> power;
+         Kokkos::View<Vec3**, T_memory_shared> splitpos;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        bool audit_enabled = false;
++        Kokkos::View<Vec3*, T_memory_shared> before_force;
++        Kokkos::View<Vec3*, T_memory_shared> before_velocity;
++        Kokkos::View<Vec3**, T_memory_shared> after_force;
++        Kokkos::View<Vec3**, T_memory_shared> after_velocity;
++#endif
+ 
+         SplitMultiNode(System* _system, DeviceDisNet* _net, TopologyParallel* topology, 
+                        F* _force, Mob* _mob) : 
+@@ -388,6 +395,10 @@ public:
+             splitDist = 2.0*rann + eps;
+             vNoise = (system->realdt > 0.0) ? system->params.rtol / system->realdt : 0.0;
+             vNoise = topology->splitMultiNodeAlpha * vNoise;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_enabled = system->event_audit &&
++                            system->event_audit->active(system->event_audit->step());
++#endif
+             
+             // Copy precomputed armsets for each split
+             for (int nconn = 3; nconn <= MAX_SPLITTABLE_DEGREE; nconn++)
+@@ -424,6 +435,13 @@ public:
+             if (tid == 0)
+                 vi = mob->node_velocity(system, net, i, fi);
+             team.team_broadcast(vi, 0);
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            if (audit_enabled && tid == 0) {
++                before_force(n) = fi;
++                before_velocity(n) = vi;
++            }
++#endif
+             
+             // Compute power dissipation of the original configuration
+             double powerMax = dot(fi, vi);
+@@ -593,6 +611,14 @@ public:
+             if (tid == 0) {
+                 power(n,0) = powerMax;
+                 power(n,1) = powerTest;
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                if (audit_enabled) {
++                    after_force(n,0) = f0;
++                    after_force(n,1) = f1;
++                    after_velocity(n,0) = v0;
++                    after_velocity(n,1) = v1;
++                }
++#endif
+             }
+         }
+     };
+@@ -689,6 +715,14 @@ public:
+         // configurations for all nodes in parallel
+         Kokkos::resize(smn->power, numsplits, 2);
+         Kokkos::resize(smn->splitpos, numsplits, 2);
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        if (smn->audit_enabled) {
++            Kokkos::resize(smn->before_force, numsplits);
++            Kokkos::resize(smn->before_velocity, numsplits);
++            Kokkos::resize(smn->after_force, numsplits, 2);
++            Kokkos::resize(smn->after_velocity, numsplits, 2);
++        }
++#endif
+         Kokkos::parallel_for(Kokkos::TeamPolicy<>(numsplits, Kokkos::AUTO), *smn);
+         Kokkos::fence();
+         
+@@ -702,6 +736,79 @@ public:
+         // let's avoid making unnecessary memory copies
+         system->net_mngr->set_active(active_net);
+         SerialDisNet* network = system->get_serial_network();
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++        auto audit_split_candidates = [&](int begin, int count, int nconn,
++                                          int accepted_split,
++                                          const std::string& selection_note) {
++            EventAuditRecorder* audit = system->event_audit;
++            if (!audit || !audit->active(audit->step())) return;
++            const double power_scale_W = std::pow(system->params.burgmag, 3);
++            const double force_scale_N = std::pow(system->params.burgmag, 2);
++            const double velocity_scale_m_s = system->params.burgmag;
++            for (int offset = 0; offset < count; ++offset) {
++                const int row_id = begin + offset;
++                const int node_id = splits(row_id, 0);
++                const int split_id = splits(row_id, 1);
++                long armset_mask = 0;
++                if (split_id >= 0) {
++                    for (int arm = 0; arm < nconn; ++arm)
++                        if (armsets[nconn](split_id, arm))
++                            armset_mask |= (1L << arm);
++                }
++                EventAuditRecord row;
++                row.step = audit->step();
++                row.time_s = audit->time_s();
++                row.dt_s = system->realdt;
++                row.mechanism = "topology_split";
++                row.stage = "topology_candidate";
++                row.candidate_id = split_id;
++                row.node_id = node_id;
++                if (split_id == accepted_split) {
++                    row.created_node_id = network->Nnodes_local;
++                    row.created_seg_id = network->Nsegs_local;
++                }
++                const Vec3 f_before = smn->before_force(row_id);
++                const Vec3 v_before = smn->before_velocity(row_id);
++                const Vec3 f_after0 = smn->after_force(row_id, 0);
++                const Vec3 f_after1 = smn->after_force(row_id, 1);
++                const Vec3 v_after0 = smn->after_velocity(row_id, 0);
++                const Vec3 v_after1 = smn->after_velocity(row_id, 1);
++                row.before_force_N[0] = f_before.x * force_scale_N;
++                row.before_force_N[1] = f_before.y * force_scale_N;
++                row.before_force_N[2] = f_before.z * force_scale_N;
++                row.before_velocity_m_s[0] = v_before.x * velocity_scale_m_s;
++                row.before_velocity_m_s[1] = v_before.y * velocity_scale_m_s;
++                row.before_velocity_m_s[2] = v_before.z * velocity_scale_m_s;
++                row.after_force0_N[0] = f_after0.x * force_scale_N;
++                row.after_force0_N[1] = f_after0.y * force_scale_N;
++                row.after_force0_N[2] = f_after0.z * force_scale_N;
++                row.after_force1_N[0] = f_after1.x * force_scale_N;
++                row.after_force1_N[1] = f_after1.y * force_scale_N;
++                row.after_force1_N[2] = f_after1.z * force_scale_N;
++                row.after_velocity0_m_s[0] = v_after0.x * velocity_scale_m_s;
++                row.after_velocity0_m_s[1] = v_after0.y * velocity_scale_m_s;
++                row.after_velocity0_m_s[2] = v_after0.z * velocity_scale_m_s;
++                row.after_velocity1_m_s[0] = v_after1.x * velocity_scale_m_s;
++                row.after_velocity1_m_s[1] = v_after1.y * velocity_scale_m_s;
++                row.after_velocity1_m_s[2] = v_after1.z * velocity_scale_m_s;
++                row.before_power_W = smn->power(row_id, 0) * power_scale_W;
++                row.after_power_W = smn->power(row_id, 1) * power_scale_W;
++                row.delta_power_W = row.after_power_W - row.before_power_W;
++                row.accepted_stock = (split_id == accepted_split) ? 1 : 0;
++                const Vec3 p0 = smn->splitpos(row_id, 0);
++                const Vec3 p1 = smn->splitpos(row_id, 1);
++                row.note = "nconn=" + std::to_string(nconn) +
++                           ";armset_mask=" + std::to_string(armset_mask) +
++                           ";split_position0_internal=" + std::to_string(p0.x) + "," +
++                           std::to_string(p0.y) + "," + std::to_string(p0.z) +
++                           ";split_position1_internal=" + std::to_string(p1.x) + "," +
++                           std::to_string(p1.y) + "," + std::to_string(p1.z) +
++                           ";stock_selection=" + selection_note;
++                audit->write(row, system);
++            }
++        };
++#endif
+         
+         std::vector<bool> nodeflag(network->Nnodes_local, 0);
+         
+@@ -725,6 +832,10 @@ public:
+                 }
+             }
+             if (skip) {
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++                audit_split_candidates(isplit, nsplit, nconn, -1,
++                                       "rejected_neighbor_conflict");
++#endif
+                 isplit += nsplit;
+                 continue;
+             }
+@@ -747,6 +858,12 @@ public:
+                 }
+                 isplit++;
+             }
++
++#ifdef EXADIS_ENABLE_EVENT_AUDIT
++            audit_split_candidates(isplit-nsplit, nsplit, nconn, kmax,
++                                   kmax >= 0 ? "accepted_max_power" :
++                                               "rejected_stock_power_threshold");
++#endif
+             
+             // Execute the favorable split and flag nodes
+             //printf(" node[%d]: kmax = %d, powerMax = %e\n", i, kmax, powerMax);

@@ -7,6 +7,7 @@ venv/
 
 # Large/generated simulation outputs
 results/
+core/exadis/
 *.nohup.log
 *.log
 *.tmp

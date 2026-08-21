@@ -101,6 +101,87 @@ def _find_first_column(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _find_informative_column(df: pd.DataFrame, names: Iterable[str]) -> Optional[str]:
+    """Find a numeric column with at least one finite, nonzero observation.
+
+    Native audit rows share a stable schema, so fields that do not apply to a
+    mechanism are present as zeros.  Selecting solely by column existence would
+    otherwise choose (for example) mobility ``tau_eff_Pa=0`` ahead of its
+    informative ``tau_local_Pa`` diagnostic.
+    """
+    fallback = None
+    for name in names:
+        column = _find_first_column(df, [name])
+        if column is None:
+            continue
+        if fallback is None:
+            fallback = column
+        values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+        if np.any(np.isfinite(values) & (np.abs(values) > 0.0)):
+            return column
+    return fallback
+
+
+def _vector_column(df: pd.DataFrame, name: str, width: int) -> Optional[np.ndarray]:
+    column = _find_first_column(df, [name])
+    if column is None:
+        return None
+    out = np.full((len(df), width), np.nan, dtype=float)
+    for index, value in enumerate(df[column]):
+        if isinstance(value, (list, tuple, np.ndarray)) and len(value) == width:
+            try:
+                out[index] = np.asarray(value, dtype=float)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def tensor_components_from_audit(df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Resolve Schmid/non-Schmid components from native ``sigma`` and geometry.
+
+    ExaDiS records stress in Voigt order ``xx, yy, zz, yz, xz, xy``.  The slip
+    direction is the normalized Burgers vector, ``n`` is the candidate/current
+    plane normal, and ``p = n x m`` is the in-plane transverse direction.
+    """
+    sigma6 = _vector_column(df, "applied_stress_Pa", 6)
+    burg = _vector_column(df, "burg", 3)
+    plane = _vector_column(df, "plane", 3)
+    if sigma6 is None or burg is None or plane is None:
+        return {}
+
+    mnorm = np.linalg.norm(burg, axis=1)
+    nnorm = np.linalg.norm(plane, axis=1)
+    valid = np.isfinite(sigma6).all(axis=1) & (mnorm > 0.0) & (nnorm > 0.0)
+    m = np.zeros_like(burg)
+    n = np.zeros_like(plane)
+    m[valid] = burg[valid] / mnorm[valid, None]
+    n[valid] = plane[valid] / nnorm[valid, None]
+    p = np.cross(n, m)
+    pnorm = np.linalg.norm(p, axis=1)
+    valid &= pnorm > 0.0
+    p[valid] /= pnorm[valid, None]
+
+    sigma = np.zeros((len(df), 3, 3), dtype=float)
+    sigma[:, 0, 0] = sigma6[:, 0]
+    sigma[:, 1, 1] = sigma6[:, 1]
+    sigma[:, 2, 2] = sigma6[:, 2]
+    sigma[:, 1, 2] = sigma[:, 2, 1] = sigma6[:, 3]
+    sigma[:, 0, 2] = sigma[:, 2, 0] = sigma6[:, 4]
+    sigma[:, 0, 1] = sigma[:, 1, 0] = sigma6[:, 5]
+
+    def contract(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        values = np.einsum("ni,nij,nj->n", left, sigma, right)
+        values[~valid] = np.nan
+        return values
+
+    return {
+        "tau_s_Pa": contract(m, n),
+        "sigma_nn_Pa": contract(n, n),
+        "sigma_mm_Pa": contract(m, m),
+        "sigma_np_Pa": contract(n, p),
+    }
+
+
 def read_jsonl(path: Path) -> pd.DataFrame:
     rows = []
     with path.open() as handle:
@@ -151,7 +232,7 @@ def hazard_probability(rate_s: np.ndarray, dt_s: np.ndarray) -> np.ndarray:
 
 def effective_stress_from_audit(df: pd.DataFrame, coupling: AnisotropicCoupling) -> np.ndarray:
     # Preferred direct columns from binding/native audit.
-    tau_col = _find_first_column(df, [
+    tau_col = _find_informative_column(df, [
         "tau_eff_Pa",
         "tau_resolved_from_applied_Pa",
         "tau_external_pk_Pa",
@@ -159,20 +240,29 @@ def effective_stress_from_audit(df: pd.DataFrame, coupling: AnisotropicCoupling)
         "tau_local_Pa",
         "tau_from_total_nodal_force_Pa",
     ])
-    if tau_col is None:
+    derived = tensor_components_from_audit(df)
+    if tau_col is not None:
+        tau = _as_float_array(df[tau_col])
+    elif "tau_s_Pa" in derived:
+        tau = np.nan_to_num(derived["tau_s_Pa"], nan=0.0)
+    else:
         return np.zeros(len(df), dtype=float)
-
-    tau = _as_float_array(df[tau_col])
     nn_col = _find_first_column(df, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"])
     mm_col = _find_first_column(df, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"])
     np_col = _find_first_column(df, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"])
 
     if nn_col is not None:
         tau = tau + coupling.a_nn * _as_float_array(df[nn_col])
+    elif "sigma_nn_Pa" in derived:
+        tau = tau + coupling.a_nn * np.nan_to_num(derived["sigma_nn_Pa"], nan=0.0)
     if mm_col is not None:
         tau = tau + coupling.a_mm * _as_float_array(df[mm_col])
+    elif "sigma_mm_Pa" in derived:
+        tau = tau + coupling.a_mm * np.nan_to_num(derived["sigma_mm_Pa"], nan=0.0)
     if np_col is not None:
         tau = tau + coupling.a_np * _as_float_array(df[np_col])
+    elif "sigma_np_Pa" in derived:
+        tau = tau + coupling.a_np * np.nan_to_num(derived["sigma_np_Pa"], nan=0.0)
 
     if coupling.abs_effective_stress:
         tau = np.abs(tau)
@@ -187,6 +277,12 @@ def _mechanism_mask(df: pd.DataFrame, tokens: Iterable[str]) -> np.ndarray:
     for tok in tokens:
         mask |= s.str.contains(tok.lower(), regex=False).to_numpy()
     return mask
+
+
+def _truthy_mask(series: pd.Series) -> np.ndarray:
+    numeric = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    text = series.astype(str).str.lower().isin(["true", "yes", "accepted", "selected"]).to_numpy()
+    return (numeric == 1.0) | text
 
 
 def fit_mobility_equivalence(df: pd.DataFrame, T_K: float, b_m: float, outdir: Path) -> dict:
@@ -224,9 +320,10 @@ def fit_mobility_equivalence(df: pd.DataFrame, T_K: float, b_m: float, outdir: P
     if len(y) < 8:
         return {"status": "too_few_rows", "mechanism": "mobility", "rows": int(len(y))}
 
-    has_nn = _find_first_column(mfit, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"]) is not None
-    has_mm = _find_first_column(mfit, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"]) is not None
-    has_np = _find_first_column(mfit, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"]) is not None
+    derived = tensor_components_from_audit(mfit)
+    has_nn = _find_first_column(mfit, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"]) is not None or "sigma_nn_Pa" in derived
+    has_mm = _find_first_column(mfit, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"]) is not None or "sigma_mm_Pa" in derived
+    has_np = _find_first_column(mfit, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"]) is not None or "sigma_np_Pa" in derived
 
     def objective(x):
         # x = [log10_eta0, log10_vstar_b3, jump_b, a_nn, a_mm, a_np]
@@ -287,6 +384,12 @@ def fit_mobility_equivalence(df: pd.DataFrame, T_K: float, b_m: float, outdir: P
 
     return {
         "status": "fit",
+        "replacement_eligible": False,
+        "replacement_blockers": [
+            "single-temperature audit cannot identify activation enthalpy and entropy separately",
+            "FCC_0 arm projection is a calibrated surrogate of shared nodal mobility, not an event-conjugate barrier",
+            "site multiplicity and event strain increment are not identified by this audit",
+        ],
         "mechanism": "mobility",
         "rows": int(len(y)),
         "method": method,
@@ -312,16 +415,44 @@ def fit_binary_hazard(
 ) -> dict:
     mask = _mechanism_mask(df, tokens)
     m = df[mask].copy()
+    rows_before_exclusion = int(len(m))
     if exclude_deterministic and "deterministic_geometry_only" in m.columns:
-        det = m["deterministic_geometry_only"].astype(str).str.lower().isin(["true", "1", "yes"])
+        det = _truthy_mask(m["deterministic_geometry_only"])
         m = m[~det].copy()
     if m.empty:
-        return {"status": "no_data", "mechanism": mechanism_name}
+        status = "insufficient_candidate_labels" if rows_before_exclusion else "no_data"
+        return {
+            "status": status,
+            "mechanism": mechanism_name,
+            "rows_before_deterministic_exclusion": rows_before_exclusion,
+            "reason": "all observed candidates were deterministic geometry/cleanup" if rows_before_exclusion else "no mechanism rows",
+            "replacement_eligible": False,
+        }
 
     acc_col = _find_first_column(m, ["accepted_stock", "accepted", "selected", "event_accepted"])
     if acc_col is None:
         return {"status": "no_acceptance_column", "mechanism": mechanism_name, "rows": int(len(m))}
-    y = m[acc_col].astype(str).str.lower().isin(["true", "1", "yes", "accepted"]).to_numpy(dtype=float)
+    numeric_labels = pd.to_numeric(m[acc_col], errors="coerce").to_numpy(dtype=float)
+    text_labels = m[acc_col].astype(str).str.lower()
+    valid = np.isin(numeric_labels, [0.0, 1.0]) | text_labels.isin(
+        ["true", "false", "yes", "no", "accepted", "rejected", "selected"]
+    ).to_numpy()
+    m = m.iloc[np.where(valid)[0]].copy()
+    if m.empty:
+        return {
+            "status": "insufficient_candidate_labels",
+            "mechanism": mechanism_name,
+            "rows_before_label_filter": rows_before_exclusion,
+            "replacement_eligible": False,
+        }
+    y = _truthy_mask(m[acc_col]).astype(float)
+    if np.unique(y).size < 2:
+        return {
+            "status": "single_acceptance_class",
+            "mechanism": mechanism_name,
+            "rows": int(len(m)),
+            "replacement_eligible": False,
+        }
 
     dt_col = _find_first_column(m, ["dt_s", "dt", "realdt_s"])
     if dt_col is None:
@@ -330,9 +461,10 @@ def fit_binary_hazard(
         dt = _as_float_array(m[dt_col], default=1e-9)
         dt = np.where(dt > 0.0, dt, 1e-9)
 
-    has_nn = _find_first_column(m, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"]) is not None
-    has_mm = _find_first_column(m, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"]) is not None
-    has_np = _find_first_column(m, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"]) is not None
+    derived = tensor_components_from_audit(m)
+    has_nn = _find_first_column(m, ["sigma_nn_Pa", "non_glide_sigma_nn_Pa"]) is not None or "sigma_nn_Pa" in derived
+    has_mm = _find_first_column(m, ["sigma_mm_Pa", "non_glide_sigma_mm_Pa"]) is not None or "sigma_mm_Pa" in derived
+    has_np = _find_first_column(m, ["sigma_np_Pa", "tau_non_planar_Pa", "secondary_shear_Pa"]) is not None or "sigma_np_Pa" in derived
 
     def nll(x):
         # x = [H, log10_sigma_c_GPa, f_logit-ish, a, n, log10_eta0, a_nn, a_mm, a_np]
@@ -390,11 +522,15 @@ def fit_binary_hazard(
         abs_effective_stress=True,
     )
     tau = effective_stress_from_audit(m, cbest)
-    prob = hazard_probability(exp_floor_rate_s(tau, T_K, pbest), dt)
+    rate = exp_floor_rate_s(tau, T_K, pbest)
+    rdt = rate * dt
+    prob = hazard_probability(rate, dt)
     pred = prob >= 0.5
     out = pd.DataFrame({
         "accepted_stock": y,
         "hazard_probability": prob,
+        "hazard_rate_s": rate,
+        "Rdt": rdt,
         "tau_eff_fit_Pa": tau,
         "dt_s": dt,
     })
@@ -402,6 +538,12 @@ def fit_binary_hazard(
 
     return {
         "status": "fit",
+        "replacement_eligible": False,
+        "replacement_blockers": [
+            "single-temperature deterministic stock decisions do not identify H, S, eta0, and activation volume uniquely",
+            "site multiplicity and event strain increment are not identified by this audit",
+            "held-out multi-temperature trajectory validation has not been run",
+        ],
         "mechanism": mechanism_name,
         "rows": int(len(m)),
         "positive_fraction": float(np.mean(y)),
@@ -412,6 +554,8 @@ def fit_binary_hazard(
         "anisotropic_coupling": asdict(cbest),
         "classification_accuracy_p05": float(np.mean(pred == y.astype(bool))),
         "probability_median": float(np.nanmedian(prob)),
+        "Rdt_median": float(np.nanmedian(rdt)),
+        "Rdt_p95": float(np.nanpercentile(rdt, 95.0)),
         "tau_eff_median_GPa": float(np.nanmedian(tau) / 1e9),
     }
 
@@ -420,12 +564,15 @@ def calibrate_native_stress_anchor(stress_strain_path: Optional[Path], strain_ra
     if stress_strain_path is None or not stress_strain_path.exists():
         return {"status": "no_stress_strain_file"}
     try:
-        dat = pd.read_csv(stress_strain_path, comment="#", delim_whitespace=True, header=None)
+        dat = pd.read_csv(stress_strain_path, comment="#", sep=r"\s+", header=None)
     except Exception as exc:
         return {"status": "read_failed", "error": str(exc)}
     if dat.shape[1] < 4 or dat.empty:
         return {"status": "empty_or_bad_format"}
-    dat.columns = ["step", "strain", "stress", "density", "walltime"][:dat.shape[1]]
+    native_columns = ["step", "strain", "stress", "density", "Nnodes", "Nsegs", "dt", "time"]
+    if dat.shape[1] > len(native_columns):
+        return {"status": "unsupported_column_count", "columns": int(dat.shape[1])}
+    dat.columns = native_columns[:dat.shape[1]]
     tail = dat.tail(max(3, len(dat)//5))
     return {
         "status": "read",
@@ -458,12 +605,15 @@ def main() -> int:
         "temperature_K": args.temperature_K,
         "burgers_m": args.burgers_m,
         "strain_rate_s": args.strain_rate_s,
+        "arrhenius_replacements_connected": False,
         "native_stress_anchor": calibrate_native_stress_anchor(args.stress_strain_dens, args.strain_rate_s),
         "fits": [],
         "notes": [
-            "These are equivalent hazards trained to stock ExaDiS audit output; they are not native replacement laws until wired into ExaDiS candidate acceptance.",
+            "These are calibrated mechanism surrogates, not universal barrier constants.",
+            "No fit is eligible for native replacement until H, S, effective activation volume phi*V*, site multiplicity, and event strain increment are identified and validated out of sample.",
             "Mobility fit uses signed linear-work Peierls kinetics to match FCC_0 velocities.",
             "Cross-slip and collision fits use binary stock acceptance labels when available.",
+            "Independent pathways combine by summing hazards; sequential obstacles require renewal/residence-time treatment and must not be collapsed into a hazard sum.",
         ],
     }
 
@@ -475,6 +625,10 @@ def main() -> int:
             summary["fits"].append(fit_binary_hazard(df, args.temperature_K, args.outdir, "cross_slip", ["cross_slip", "cross-slip", "xslip"]))
         if not args.no_collision:
             summary["fits"].append(fit_binary_hazard(df, args.temperature_K, args.outdir, "collision", ["collision", "annihilation"]))
+
+    summary["native_replacement_authorized"] = bool(summary["fits"]) and all(
+        fit.get("replacement_eligible", False) for fit in summary["fits"]
+    )
 
     with (args.outdir / "anisotropic_hazard_fit_summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)

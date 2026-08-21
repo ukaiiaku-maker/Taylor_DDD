@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Fit equivalent anisotropic Arrhenius hazards against an ExaDiS audit JSONL.
 # This script assumes the event audit was produced by
-# scripts/run_exadis_binding_event_audit.sh or by a future native audit path.
+# scripts/run_exadis_native_candidate_smoke.sh or run_exadis_native_audit.sh.
 
-ROOT=${ROOT:-results/exadis_binding_event_audit/audit_enabled}
+ROOT=${ROOT:-results/exadis_native_candidate_smoke/audit_enabled}
 AUDIT_JSONL=${AUDIT_JSONL:-$ROOT/event_audit.jsonl}
 STRESS_STRAIN=${STRESS_STRAIN:-$ROOT/stress_strain_dens.dat}
 OUTDIR=${OUTDIR:-results/exadis_anisotropic_hazard_fit}
@@ -16,7 +16,7 @@ STRAIN_RATE_S=${STRAIN_RATE_S:-1.0e3}
 
 if [[ ! -f "$AUDIT_JSONL" ]]; then
   echo "error: audit JSONL not found: $AUDIT_JSONL" >&2
-  echo "run scripts/run_exadis_binding_event_audit.sh first, or set AUDIT_JSONL=/path/to/event_audit.jsonl" >&2
+  echo "run scripts/run_exadis_native_candidate_smoke.sh first, or set AUDIT_JSONL=/path/to/event_audit.jsonl" >&2
   exit 2
 fi
 
