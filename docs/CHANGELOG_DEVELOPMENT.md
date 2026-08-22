@@ -23,3 +23,14 @@ Avalanche/burst diagnostics were introduced: burst grouping, CCDF tables, random
 ## v17
 
 The active local stress cap was removed and the local barrier stress was computed using a physical feeding length. This made the model cap-free in the relevant diagnostics and made the high-density hardening/intermittency analysis physically interpretable.
+
+## Native ExaDiS Taylor force-work transfer
+
+A shared native Taylor line-tension interaction kernel now supplies the
+force-work bias for classified D-D topology and cross-slip candidates. Fixed
+D-D stress-concentration factors were removed, harmonic adjacent-arm length and
+emergent `phi_eff` are audited, and an exact no-double-counting validator was
+added. The kernel regression and audit invariance pass, but the high-barrier
+3-D density sweep remains a startup plateau with zero accepted interaction
+events and fails the required 0.4–0.6 Taylor slope. See
+`EXADIS_NATIVE_TAYLOR_FORCE_WORK_REPORT.md`.

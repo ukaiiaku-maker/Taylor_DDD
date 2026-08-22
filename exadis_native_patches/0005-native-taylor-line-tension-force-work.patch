@@ -1,0 +1,957 @@
+diff --git a/python/CMakeLists.txt b/python/CMakeLists.txt
+index 44218fc..f9b9159 100644
+--- a/python/CMakeLists.txt
++++ b/python/CMakeLists.txt
+@@ -23,6 +23,7 @@ endif()
+ set(EXADIS_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+ set(SOURCES
+     ${EXADIS_SRC_PATH}/arrhenius/arrhenius_exp_floor.cpp
++    ${EXADIS_SRC_PATH}/arrhenius/taylor_line_tension_interaction.cpp
+     ${EXADIS_SRC_PATH}/driver.cpp
+     ${EXADIS_SRC_PATH}/generate.cpp
+     ${EXADIS_SRC_PATH}/network.cpp
+diff --git a/python/exadis_pybind.cpp b/python/exadis_pybind.cpp
+index 76e1e19..3570731 100644
+--- a/python/exadis_pybind.cpp
++++ b/python/exadis_pybind.cpp
+@@ -1044,7 +1044,7 @@ PYBIND11_MODULE(pyexadis, m) {
+     py::class_<Arrhenius::DiscreteEventParams>(m, "Arrhenius_DiscreteEvent_Params")
+         .def(py::init<bool, double, double, double, double, double, double,
+                       double, double, double, double, double, double, double,
+-                      double, double, std::uint64_t>(),
++                      double, double, std::uint64_t, double, double, int>(),
+              py::arg("enabled"), py::arg("temperature_K"), py::arg("H_eV"),
+              py::arg("S_kB"), py::arg("sigma_c_GPa"), py::arg("f"),
+              py::arg("a"), py::arg("n"), py::arg("eta0_s"),
+@@ -1052,7 +1052,10 @@ PYBIND11_MODULE(pyexadis, m) {
+              py::arg("a_nn")=0.0, py::arg("a_mm")=0.0,
+              py::arg("a_np")=0.0, py::arg("a_other")=0.0,
+              py::arg("high_hazard_Rdt")=20.0,
+-             py::arg("seed")=0x6a09e667f3bcc909ULL);
++             py::arg("seed")=0x6a09e667f3bcc909ULL,
++             py::arg("x_dagger_b")=1.0,
++             py::arg("line_tension_alpha")=0.5,
++             py::arg("force_source")=0);
+ 
+     py::class_<Topology::Params>(m, "Topology_Params")
+         .def(py::init<double>(), py::arg("splitMultiNodeAlpha"))
+@@ -1064,6 +1067,66 @@ PYBIND11_MODULE(pyexadis, m) {
+         .def(py::init<>())
+         .def(py::init<const std::vector<Arrhenius::DiscreteEventParams>&>(),
+              py::arg("arrhenius_events"));
++
++    m.def("evaluate_taylor_line_tension_interaction",
++        [](double F_event_N, double L_left_m, double L_right_m,
++           double tau_app_resolved_Pa, double dt_s, double temperature_K,
++           double H_eV, double S_kB, double sigma_c_GPa, double f,
++           double a, double n, double eta0_s, double vstar_b3,
++           double x_dagger_b, double b_m, double mu_Pa,
++           double line_tension_alpha) {
++            Arrhenius::ExpFloorParams barrier;
++            barrier.H_eV = H_eV;
++            barrier.S_kB = S_kB;
++            barrier.sigma_c_Pa = sigma_c_GPa * 1.0e9;
++            barrier.floor_fraction = f;
++            barrier.shape_a = a;
++            barrier.shape_n = n;
++            barrier.eta0_s = eta0_s;
++            barrier.vstar_m3 = vstar_b3 * b_m * b_m * b_m;
++            Arrhenius::TaylorInteractionInput input;
++            input.b_m = b_m;
++            input.mu_Pa = mu_Pa;
++            input.alpha_line_tension = line_tension_alpha;
++            input.event_direction = Vec3(1.0, 0.0, 0.0);
++            input.line_direction_a = Vec3(1.0, 0.0, 0.0);
++            input.line_direction_b = Vec3(1.0, 0.0, 0.0);
++            input.L_left_m = L_left_m;
++            input.L_right_m = L_right_m;
++            input.L_eff_m = Arrhenius::harmonic_adjacent_arm_length(
++                L_left_m, L_right_m);
++            input.x_dagger_m = x_dagger_b * b_m;
++            input.vstar_m3 = barrier.vstar_m3;
++            input.native_projected_force_available = true;
++            input.native_projected_force_N = F_event_N;
++            input.tau_app_resolved_Pa = tau_app_resolved_Pa;
++            input.dt_s = dt_s;
++            input.temperature_K = temperature_K;
++            const auto out = Arrhenius::evaluate_taylor_interaction(
++                input, barrier, Arrhenius::NATIVE_TRIAL_FORCE_PREFERRED);
++            py::dict result;
++            result["line_tension_N"] = out.line_tension_N;
++            result["F_line_tension_N"] = out.F_line_tension_N;
++            result["F_event_N"] = out.F_event_N;
++            result["work_bias_J"] = out.work_bias_J;
++            result["tau_eff_Pa"] = out.tau_eff_Pa;
++            result["phi_eff"] = out.phi_eff;
++            result["phi_geom_L_over_b"] = out.phi_geom_L_over_b;
++            result["L_eff_m"] = out.L_eff_m;
++            result["G_eV"] = out.G_eV;
++            result["G_floor_eV"] = out.G_floor_eV;
++            result["G_used_eV"] = out.G_used_eV;
++            result["rate_s"] = out.rate_s;
++            result["Rdt"] = out.Rdt;
++            result["P"] = out.probability;
++            return result;
++        },
++        py::arg("F_event_N"), py::arg("L_left_m"), py::arg("L_right_m"),
++        py::arg("tau_app_resolved_Pa"), py::arg("dt_s"),
++        py::arg("temperature_K"), py::arg("H_eV"), py::arg("S_kB"),
++        py::arg("sigma_c_GPa"), py::arg("f"), py::arg("a"), py::arg("n"),
++        py::arg("eta0_s"), py::arg("vstar_b3"), py::arg("x_dagger_b"),
++        py::arg("b_m"), py::arg("mu_Pa"), py::arg("line_tension_alpha"));
+     
+     py::class_<RemeshSerial::Params>(m, "Remesh_Params")
+         .def(py::init<bool, int>(), py::arg("remove_small_loops"), py::arg("coarsen_mode"));
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 80c55a4..1d73359 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.14)
+ 
+ set(SOURCES
+     arrhenius/arrhenius_exp_floor.cpp
++    arrhenius/taylor_line_tension_interaction.cpp
+     driver.cpp
+     generate.cpp
+     network.cpp
+diff --git a/src/arrhenius/discrete_hazard.h b/src/arrhenius/discrete_hazard.h
+index 17db525..295d439 100644
+--- a/src/arrhenius/discrete_hazard.h
++++ b/src/arrhenius/discrete_hazard.h
+@@ -7,6 +7,7 @@
+ #define EXADIS_ARRHENIUS_DISCRETE_HAZARD_H
+ 
+ #include "arrhenius/arrhenius_exp_floor.h"
++#include "arrhenius/taylor_line_tension_interaction.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -20,6 +21,7 @@ struct DiscreteEventParams {
+     double temperature_K = -1.0;
+     ExpFloorParams barrier;
+     StressCoupling coupling;
++    TaylorInteractionParams taylor;
+     double high_hazard_Rdt = 20.0;
+     std::uint64_t seed = 0x6a09e667f3bcc909ULL;
+ 
+@@ -32,7 +34,10 @@ struct DiscreteEventParams {
+                         double a_nn=0.0, double a_mm=0.0,
+                         double a_np=0.0, double a_other=0.0,
+                         double high_hazard_Rdt_=20.0,
+-                        std::uint64_t seed_=0x6a09e667f3bcc909ULL)
++                        std::uint64_t seed_=0x6a09e667f3bcc909ULL,
++                        double x_dagger_b=1.0,
++                        double line_tension_alpha=0.5,
++                        int force_source=0)
+         : enabled(enabled_), temperature_K(temperature_K_),
+           high_hazard_Rdt(high_hazard_Rdt_), seed(seed_)
+     {
+@@ -44,6 +49,10 @@ struct DiscreteEventParams {
+         barrier.shape_n = shape_n;
+         barrier.eta0_s = eta0_s;
+         barrier.vstar_m3 = vstar_b3 * burgmag_m * burgmag_m * burgmag_m;
++        taylor.x_dagger_m = x_dagger_b * burgmag_m;
++        taylor.line_tension_alpha = line_tension_alpha;
++        taylor.force_source = force_source == 1 ?
++            LINE_TENSION_RECONSTRUCTION : NATIVE_TRIAL_FORCE_PREFERRED;
+         coupling.a_nn = a_nn;
+         coupling.a_mm = a_mm;
+         coupling.a_np = a_np;
+@@ -67,6 +76,8 @@ struct HazardDecision {
+     double accumulated_after = 0.0;
+     double threshold = 0.0;
+     double residence_time_s = 0.0;
++    std::uint64_t residence_key = 0;
++    std::uint64_t renewal_generation = 0;
+ };
+ 
+ class ResidenceHazard {
+@@ -83,6 +94,8 @@ public:
+         }
+ 
+         HazardDecision out;
++        out.residence_key = key;
++        out.renewal_generation = state.generation;
+         out.accumulated_before = state.accumulated_hazard;
+         out.threshold = state.threshold;
+ 
+diff --git a/src/audit/event_audit.cpp b/src/audit/event_audit.cpp
+index b25e004..aa7506f 100644
+--- a/src/audit/event_audit.cpp
++++ b/src/audit/event_audit.cpp
+@@ -173,21 +173,25 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+ 
+     std::fprintf(stream_,
+         "{\"record_type\":\"event\",\"step\":%ld,\"time_s\":%.17g,"
+-        "\"dt_s\":%.17g,\"mechanism\":\"%s\",\"stage\":\"%s\","
+-        "\"event_class\":\"%s\","
++        "\"dt_s\":%.17g,\"mechanism\":\"%s\",\"stage\":\"%s\","
++        "\"event_class\":\"%s\",\"interaction_class\":\"%s\","
+         "\"candidate_id\":%d,\"node_id\":%d,\"seg_id\":%d,\"seg2_id\":%d,"
+         "\"created_node_id\":%d,\"created_seg_id\":%d,"
+-        "\"n1\":%d,\"n2\":%d,\"L_m\":%.17g",
++        "\"n1\":%d,\"n2\":%d,\"junction_id\":%d,\"L_m\":%.17g",
+         row.step, row.time_s, row.dt_s,
+         json_escape(row.mechanism).c_str(), json_escape(row.stage).c_str(),
+         json_escape(row.event_class).c_str(),
++        json_escape(row.interaction_class).c_str(),
+         row.candidate_id, row.node_id, row.seg_id, row.seg2_id,
+         row.created_node_id, row.created_seg_id,
+-        row.n1, row.n2, row.L_m);
++        row.n1, row.n2, row.junction_id, row.L_m);
+     write_vec3(stream_, "burg", row.burg);
++    write_vec3(stream_, "burg2", row.burg2);
+     write_vec3(stream_, "plane", row.plane);
+     write_vec3(stream_, "current_plane", row.current_plane);
+     write_vec3(stream_, "line", row.line);
++    write_vec3(stream_, "line2", row.line2);
++    write_vec3(stream_, "event_direction", row.event_direction);
+     write_vec6(stream_, "applied_stress_Pa", row.applied_stress_Pa);
+     write_vec6(stream_, "activation_tensor_m3", row.activation_tensor_m3);
+     write_vec3(stream_, "force_N", row.force_N);
+@@ -204,6 +208,14 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         "\"arm_mobility_internal\":%.17g,"
+         "\"L_over_mobility_internal\":%.17g,\"LtimesB_internal\":%.17g,"
+         "\"tau_local_Pa\":%.17g,\"tau_eff_Pa\":%.17g,"
++        "\"tau_app_resolved_Pa\":%.17g,\"phi_eff\":%.17g,"
++        "\"phi_geom_L_over_b\":%.17g,\"L_left_m\":%.17g,"
++        "\"L_right_m\":%.17g,\"L_min_m\":%.17g,"
++        "\"L_harmonic_m\":%.17g,\"L_sum_m\":%.17g,\"L_eff_m\":%.17g,"
++        "\"L_eff_definition\":\"%s\",\"line_tension_N\":%.17g,"
++        "\"line_tension_force_projected_N\":%.17g,"
++        "\"native_force_projected_N\":%.17g,\"F_event_used_N\":%.17g,"
++        "\"force_source\":\"%s\","
+         "\"temperature_K\":%.17g,\"H_eV\":%.17g,\"S_kB\":%.17g,"
+         "\"sigma_c_GPa\":%.17g,\"floor_fraction_f\":%.17g,"
+         "\"shape_a\":%.17g,\"shape_n\":%.17g,\"eta0_s\":%.17g,"
+@@ -215,18 +227,26 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         "\"event_count\":%d,\"residence_time_s\":%.17g,"
+         "\"accumulated_hazard_before\":%.17g,"
+         "\"accumulated_hazard_after\":%.17g,"
++        "\"residence_key\":%llu,\"renewal_generation\":%llu,"
+         "\"x_dagger_m\":%.17g,\"v_star_m3\":%.17g,"
+         "\"delta_work_J\":%.17g,\"before_power_W\":%.17g,"
+         "\"after_power_W\":%.17g,\"delta_power_W\":%.17g,"
+         "\"before_energy_J\":%.17g,\"after_energy_J\":%.17g,"
+         "\"delta_energy_J\":%.17g,\"accepted_stock\":%d,"
+         "\"deterministic_geometry_only\":%d,"
+-        "\"plastic_strain_increment\":%.17g,\"note\":\"%s\"}\n",
++        "\"plastic_strain_increment\":%.17g,\"swept_area_m2\":%.17g,"
++        "\"note\":\"%s\"}\n",
+         row.character_screw_abs, row.force_glide_N, row.velocity_glide_m_s,
+         row.arm_mobility_internal, row.L_over_mobility_internal,
+         row.LtimesB_internal,
+         row.tau_local_Pa,
+-        row.tau_eff_Pa, row.temperature_K, row.H_eV, row.S_kB,
++        row.tau_eff_Pa, row.tau_app_resolved_Pa, row.phi_eff,
++        row.phi_geom_L_over_b, row.L_left_m, row.L_right_m,
++        row.L_min_m, row.L_harmonic_m, row.L_sum_m, row.L_eff_m,
++        json_escape(row.L_eff_definition).c_str(), row.line_tension_N,
++        row.line_tension_force_projected_N, row.native_force_projected_N,
++        row.F_event_used_N, json_escape(row.force_source).c_str(),
++        row.temperature_K, row.H_eV, row.S_kB,
+         row.sigma_c_GPa, row.floor_fraction_f, row.shape_a, row.shape_n,
+         row.eta0_s, row.activation_work_J, row.G_eV, row.G_floor_eV,
+         row.G_used_eV, row.R_s, row.Rdt, row.probability,
+@@ -235,11 +255,14 @@ void EventAuditRecorder::write(EventAuditRecord row, System* system)
+         row.deterministic_high_hazard, row.event_count,
+         row.residence_time_s, row.accumulated_hazard_before,
+         row.accumulated_hazard_after,
++        static_cast<unsigned long long>(row.residence_key),
++        static_cast<unsigned long long>(row.renewal_generation),
+         row.x_dagger_m, row.v_star_m3,
+         row.delta_work_J, row.before_power_W, row.after_power_W,
+         row.delta_power_W, row.before_energy_J, row.after_energy_J,
+         row.delta_energy_J, row.accepted_stock,
+         row.deterministic_geometry_only, row.plastic_strain_increment,
++        row.swept_area_m2,
+         json_escape(row.note).c_str());
+ }
+ 
+diff --git a/src/audit/event_audit.h b/src/audit/event_audit.h
+index 1d252da..d4e0e3c 100644
+--- a/src/audit/event_audit.h
++++ b/src/audit/event_audit.h
+@@ -38,6 +38,7 @@ struct EventAuditRecord {
+     std::string mechanism;
+     std::string stage;
+     std::string event_class;
++    std::string interaction_class;
+     int candidate_id = -1;
+     int node_id = -1;
+     int seg_id = -1;
+@@ -46,11 +47,15 @@ struct EventAuditRecord {
+     int created_seg_id = -1;
+     int n1 = -1;
+     int n2 = -1;
++    int junction_id = -1;
+     double L_m = 0.0;
+     double burg[3] = {0.0, 0.0, 0.0};
++    double burg2[3] = {0.0, 0.0, 0.0};
+     double plane[3] = {0.0, 0.0, 0.0};
+     double current_plane[3] = {0.0, 0.0, 0.0};
+     double line[3] = {0.0, 0.0, 0.0};
++    double line2[3] = {0.0, 0.0, 0.0};
++    double event_direction[3] = {0.0, 0.0, 0.0};
+     double applied_stress_Pa[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+     double character_screw_abs = 0.0;
+     double force_N[3] = {0.0, 0.0, 0.0};
+@@ -68,6 +73,21 @@ struct EventAuditRecord {
+     double LtimesB_internal = 0.0;
+     double tau_local_Pa = 0.0;
+     double tau_eff_Pa = 0.0;
++    double tau_app_resolved_Pa = 0.0;
++    double phi_eff = 0.0;
++    double phi_geom_L_over_b = 0.0;
++    double L_left_m = 0.0;
++    double L_right_m = 0.0;
++    double L_min_m = 0.0;
++    double L_harmonic_m = 0.0;
++    double L_sum_m = 0.0;
++    double L_eff_m = 0.0;
++    std::string L_eff_definition;
++    double line_tension_N = 0.0;
++    double line_tension_force_projected_N = 0.0;
++    double native_force_projected_N = 0.0;
++    double F_event_used_N = 0.0;
++    std::string force_source;
+     double activation_tensor_m3[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+     double temperature_K = 0.0;
+     double H_eV = 0.0;
+@@ -93,6 +113,8 @@ struct EventAuditRecord {
+     double residence_time_s = 0.0;
+     double accumulated_hazard_before = 0.0;
+     double accumulated_hazard_after = 0.0;
++    std::uint64_t residence_key = 0;
++    std::uint64_t renewal_generation = 0;
+     double x_dagger_m = 0.0;
+     double v_star_m3 = 0.0;
+     double delta_work_J = 0.0;
+@@ -105,6 +127,7 @@ struct EventAuditRecord {
+     int accepted_stock = -1;
+     int deterministic_geometry_only = 0;
+     double plastic_strain_increment = 0.0;
++    double swept_area_m2 = 0.0;
+     std::string note;
+ };
+ 
+diff --git a/src/cross_slip_types/cross_slip_parallel.h b/src/cross_slip_types/cross_slip_parallel.h
+index e49e3c6..e2f540d 100644
+--- a/src/cross_slip_types/cross_slip_parallel.h
++++ b/src/cross_slip_types/cross_slip_parallel.h
+@@ -52,6 +52,8 @@ public:
+                                  event_class);
+                 Arrhenius::validate(p.barrier, p.temperature_K,
+                                     "cross slip discrete event");
++                Arrhenius::validate_taylor_interaction(
++                    p.taylor, p.barrier, "cross slip discrete event");
+                 if (!(std::isfinite(p.high_hazard_Rdt) &&
+                       p.high_hazard_Rdt > 0.0))
+                     ExaDiS_fatal("Error: invalid Arrhenius cross-slip high-hazard threshold\n");
+@@ -70,7 +72,8 @@ public:
+         int n1, n2, s1, s2;
+         int plane1, plane2, force_plane;
+         int seg1_is_screw, seg2_is_screw, both_segments_screw;
+-        Vec3 burg, line, current_plane, fLab, fCrystal;
++        Vec3 burg, line, line_a, line_b, event_direction;
++        Vec3 current_plane, fLab, fCrystal;
+         double L1, L2, burgSize;
+         double primary_force, cross_force, force_threshold;
+         int stock_force_eligible;
+@@ -412,6 +415,11 @@ public:
+                 event.both_segments_screw = bothseg_are_screw;
+                 event.burg = burgSize * burg;
+                 event.line = vec1.normalized();
++                event.line_a = vec2.norm2() > 0.0 ?
++                    (-1.0 * vec2).normalized() : Vec3(0.0);
++                event.line_b = vec3.norm2() > 0.0 ?
++                    (-1.0 * vec3).normalized() : Vec3(0.0);
++                event.event_direction = glideDirLab[fplane].normalized();
+                 event.plane = newplane;
+                 event.current_plane = segs[s1].plane.normalized();
+                 event.fLab = fLab;
+@@ -714,6 +722,10 @@ public:
+             double sigma_nn_Pa = 0.0;
+             double sigma_mm_Pa = 0.0;
+             double sigma_np_Pa = 0.0;
++            double swept_area_m2 = 0.0;
++            double plastic_strain_increment = 0.0;
++            Arrhenius::TaylorInteractionInput taylor_input;
++            Arrhenius::TaylorInteractionOutput taylor_output;
+         };
+         std::vector<CandidateKinetics> kinetics(numcsnodes);
+         std::vector<int> kinetic_accept(numcsnodes, 0);
+@@ -751,20 +763,74 @@ public:
+                     (event.cross_force - event.primary_force) / force_area :
+                     candidate.tau_cross_Pa - candidate.tau_primary_Pa;
+ 
+-                Arrhenius::StressComponents components;
+-                // The native candidate force contains applied, self, and
+-                // interaction stresses. Use its resolved plane difference for
+-                // the Schmid work, then add tensorial external non-Schmid work.
+-                components.tau_s_Pa = candidate.tau_schmid_local_Pa;
+-                components.sigma_nn_Pa = candidate.sigma_nn_Pa;
+-                components.sigma_mm_Pa = candidate.sigma_mm_Pa;
+-                components.sigma_np_Pa = candidate.sigma_np_Pa;
+-                components.sigma_other_Pa =
+-                    SIGN(candidate.sigma_nn_Pa) * fabs(candidate.sigma_nn_Pa);
+-                const double tau_eff = Arrhenius::effective_stress_Pa(
+-                    components, p.coupling);
+-                candidate.evaluation = Arrhenius::evaluate(
+-                    tau_eff, p.temperature_K, system->realdt, p.barrier);
++                const double b_m = system->params.burgmag;
++                const double force_scale_N = b_m * b_m;
++                Arrhenius::TaylorInteractionInput& input =
++                    candidate.taylor_input;
++                input.mechanism_id = candidate.event_class;
++                input.candidate_id = event.type;
++                input.node_id = h_csnodes(k);
++                input.seg_id_a = event.s1;
++                input.seg_id_b = event.s2;
++                input.junction_id = h_csnodes(k);
++                input.b_m = b_m;
++                input.mu_Pa = system->params.MU;
++                input.alpha_line_tension = p.taylor.line_tension_alpha;
++                input.event_direction = event.event_direction;
++                input.line_direction_a = event.line_a;
++                input.line_direction_b = event.line_b;
++                input.burgers_a = b_m * event.burg;
++                input.burgers_b = b_m * event.burg;
++                input.plane_normal = n_cross;
++                input.L_left_m = event.L1 * b_m;
++                input.L_right_m = event.L2 * b_m;
++                input.L_eff_m = Arrhenius::harmonic_adjacent_arm_length(
++                    input.L_left_m, input.L_right_m);
++                input.x_dagger_m = p.taylor.x_dagger_m;
++                input.vstar_m3 = p.barrier.vstar_m3;
++                input.native_projected_force_available = true;
++                input.native_projected_force_N =
++                    (event.cross_force - event.primary_force) * force_scale_N;
++                input.native_force_available = true;
++                input.native_force_before_N = input.native_projected_force_N *
++                    event.event_direction;
++                input.native_force_after_N = input.native_force_before_N;
++                input.tau_app_resolved_Pa =
++                    candidate.tau_cross_Pa - candidate.tau_primary_Pa;
++                input.dt_s = system->realdt;
++                input.temperature_K = p.temperature_K;
++                candidate.taylor_output =
++                    Arrhenius::evaluate_taylor_interaction(
++                        input, p.barrier, p.taylor.force_source);
++                const Arrhenius::TaylorInteractionOutput& taylor =
++                    candidate.taylor_output;
++                candidate.evaluation.tau_eff_Pa = taylor.tau_eff_Pa;
++                candidate.evaluation.activation_work_J = taylor.work_bias_J;
++                candidate.evaluation.G_eV = taylor.G_eV;
++                candidate.evaluation.G_floor_eV = taylor.G_floor_eV;
++                candidate.evaluation.G_used_eV = taylor.G_used_eV;
++                candidate.evaluation.rate_s = taylor.rate_s;
++                candidate.evaluation.Rdt = taylor.Rdt;
++                candidate.evaluation.probability = taylor.probability;
++
++                double trial_coordinate_m = 0.0;
++                if (event.type < 2) {
++                    const Vec3 old_i = network->nodes[h_csnodes(k)].pos;
++                    const Vec3 old_n = network->nodes[
++                        network->conn[h_csnodes(k)].node[1-event.type]].pos;
++                    trial_coordinate_m = 0.5 * b_m *
++                        ((event.p0 - old_i).norm() + (event.p1 - old_n).norm());
++                } else {
++                    const int neighbor = network->conn[h_csnodes(k)].node[event.type-2];
++                    trial_coordinate_m = b_m *
++                        (event.p1 - network->nodes[neighbor].pos).norm();
++                }
++                candidate.swept_area_m2 = 0.5 *
++                    (input.L_left_m + input.L_right_m) * trial_coordinate_m;
++                const double volume_m3 = network->cell.volume() *
++                                         std::pow(b_m, 3);
++                candidate.plastic_strain_increment = volume_m3 > 0.0 ?
++                    b_m * candidate.swept_area_m2 / volume_m3 : 0.0;
+ 
+                 const Mat33 shear_cross = 0.5 *
+                     (outer(slip, n_cross) + outer(n_cross, slip));
+@@ -986,6 +1052,7 @@ public:
+                     row.shape_n = p.barrier.shape_n;
+                     row.eta0_s = p.barrier.eta0_s;
+                     row.v_star_m3 = p.barrier.vstar_m3;
++                    row.x_dagger_m = p.taylor.x_dagger_m;
+                     row.tau_local_Pa = candidate.tau_schmid_local_Pa;
+                     row.tau_eff_Pa = e.tau_eff_Pa;
+                     row.activation_work_J = e.activation_work_J;
+@@ -1001,9 +1068,49 @@ public:
+                         candidate.decision.accumulated_before;
+                     row.accumulated_hazard_after =
+                         candidate.decision.accumulated_after;
++                    row.residence_key = candidate.decision.residence_key;
++                    row.renewal_generation =
++                        candidate.decision.renewal_generation;
+                     row.deterministic_high_hazard =
+                         candidate.decision.deterministic_high_hazard ? 1 : 0;
+                     row.event_count = eventflag[k] == 1 ? 1 : 0;
++                    row.interaction_class = "D_D_cross_slip_interaction";
++                    row.junction_id = i;
++                    row.L_left_m = candidate.taylor_input.L_left_m;
++                    row.L_right_m = candidate.taylor_input.L_right_m;
++                    row.L_min_m = candidate.taylor_output.L_min_m;
++                    row.L_harmonic_m = candidate.taylor_output.L_harmonic_m;
++                    row.L_sum_m = candidate.taylor_output.L_sum_m;
++                    row.L_eff_m = candidate.taylor_output.L_eff_m;
++                    row.L_eff_definition = "harmonic_adjacent_arms";
++                    row.phi_geom_L_over_b =
++                        candidate.taylor_output.phi_geom_L_over_b;
++                    row.phi_eff = candidate.taylor_output.phi_eff;
++                    row.tau_app_resolved_Pa =
++                        candidate.taylor_input.tau_app_resolved_Pa;
++                    row.line_tension_N = candidate.taylor_output.line_tension_N;
++                    row.line_tension_force_projected_N =
++                        candidate.taylor_output.F_line_tension_N;
++                    row.native_force_projected_N =
++                        candidate.taylor_output.F_native_projected_N;
++                    row.F_event_used_N = candidate.taylor_output.F_event_N;
++                    row.force_source = Arrhenius::taylor_force_source_name(
++                        candidate.taylor_output.force_source_used);
++                    const Vec3& tq = candidate.taylor_input.event_direction;
++                    const Vec3& tla = candidate.taylor_input.line_direction_a;
++                    const Vec3& tlb = candidate.taylor_input.line_direction_b;
++                    row.event_direction[0] = tq.x;
++                    row.event_direction[1] = tq.y;
++                    row.event_direction[2] = tq.z;
++                    row.line[0] = tla.x; row.line[1] = tla.y; row.line[2] = tla.z;
++                    row.line2[0] = tlb.x; row.line2[1] = tlb.y; row.line2[2] = tlb.z;
++                    row.burg2[0] = row.burg[0];
++                    row.burg2[1] = row.burg[1];
++                    row.burg2[2] = row.burg[2];
++                    row.swept_area_m2 = eventflag[k] == 1 ?
++                        candidate.swept_area_m2 : 0.0;
++                    row.plastic_strain_increment = eventflag[k] == 1 ?
++                        candidate.plastic_strain_increment : 0.0;
+                     row.activation_tensor_m3[0] = candidate.activation_tensor.xx();
+                     row.activation_tensor_m3[1] = candidate.activation_tensor.yy();
+                     row.activation_tensor_m3[2] = candidate.activation_tensor.zz();
+diff --git a/src/topology_types/topology_parallel.h b/src/topology_types/topology_parallel.h
+index a19c3de..e8ac9a2 100644
+--- a/src/topology_types/topology_parallel.h
++++ b/src/topology_types/topology_parallel.h
+@@ -367,6 +367,8 @@ public:
+                                  event_class);
+                 Arrhenius::validate(p.barrier, p.temperature_K,
+                                     "topology discrete event");
++                Arrhenius::validate_taylor_interaction(
++                    p.taylor, p.barrier, "topology discrete event");
+                 if (!(std::isfinite(p.high_hazard_Rdt) &&
+                       p.high_hazard_Rdt > 0.0))
+                     ExaDiS_fatal("Error: invalid Arrhenius topology high-hazard threshold\n");
+@@ -816,6 +818,10 @@ public:
+             bool geometry_admissible = false;
+             bool kinetically_eligible = false;
+             double trial_work_J = 0.0;
++            double swept_area_m2 = 0.0;
++            double plastic_strain_increment = 0.0;
++            Arrhenius::TaylorInteractionInput taylor_input;
++            Arrhenius::TaylorInteractionOutput taylor_output;
+             Arrhenius::Evaluation evaluation;
+             Arrhenius::HazardDecision decision;
+         };
+@@ -906,7 +912,8 @@ public:
+                     row.shape_n = p.barrier.shape_n;
+                     row.eta0_s = p.barrier.eta0_s;
+                     row.v_star_m3 = p.barrier.vstar_m3;
+-                    row.activation_work_J = candidate.trial_work_J;
++                    row.x_dagger_m = p.taylor.x_dagger_m;
++                    row.activation_work_J = candidate.taylor_output.work_bias_J;
+                     row.delta_work_J = candidate.trial_work_J;
+                     row.tau_eff_Pa = e.tau_eff_Pa;
+                     row.G_eV = e.G_eV;
+@@ -921,9 +928,52 @@ public:
+                         candidate.decision.accumulated_before;
+                     row.accumulated_hazard_after =
+                         candidate.decision.accumulated_after;
++                    row.residence_key = candidate.decision.residence_key;
++                    row.renewal_generation =
++                        candidate.decision.renewal_generation;
+                     row.deterministic_high_hazard =
+                         candidate.decision.deterministic_high_hazard ? 1 : 0;
+                     row.event_count = arrhenius_selected[row_id];
++                    row.interaction_class = "D_D_junction";
++                    row.junction_id = node_id;
++                    row.L_left_m = candidate.taylor_input.L_left_m;
++                    row.L_right_m = candidate.taylor_input.L_right_m;
++                    row.L_min_m = candidate.taylor_output.L_min_m;
++                    row.L_harmonic_m = candidate.taylor_output.L_harmonic_m;
++                    row.L_sum_m = candidate.taylor_output.L_sum_m;
++                    row.L_eff_m = candidate.taylor_output.L_eff_m;
++                    row.L_eff_definition = "harmonic_adjacent_arms";
++                    row.phi_geom_L_over_b =
++                        candidate.taylor_output.phi_geom_L_over_b;
++                    row.phi_eff = candidate.taylor_output.phi_eff;
++                    row.tau_app_resolved_Pa =
++                        candidate.taylor_input.tau_app_resolved_Pa;
++                    row.line_tension_N = candidate.taylor_output.line_tension_N;
++                    row.line_tension_force_projected_N =
++                        candidate.taylor_output.F_line_tension_N;
++                    row.native_force_projected_N =
++                        candidate.taylor_output.F_native_projected_N;
++                    row.F_event_used_N = candidate.taylor_output.F_event_N;
++                    row.force_source = Arrhenius::taylor_force_source_name(
++                        candidate.taylor_output.force_source_used);
++                    const Vec3& q = candidate.taylor_input.event_direction;
++                    const Vec3& ta = candidate.taylor_input.line_direction_a;
++                    const Vec3& tb = candidate.taylor_input.line_direction_b;
++                    row.event_direction[0] = q.x;
++                    row.event_direction[1] = q.y;
++                    row.event_direction[2] = q.z;
++                    row.line[0] = ta.x; row.line[1] = ta.y; row.line[2] = ta.z;
++                    row.line2[0] = tb.x; row.line2[1] = tb.y; row.line2[2] = tb.z;
++                    row.seg_id = candidate.taylor_input.seg_id_a;
++                    row.seg2_id = candidate.taylor_input.seg_id_b;
++                    const Vec3& ba = candidate.taylor_input.burgers_a;
++                    const Vec3& bb = candidate.taylor_input.burgers_b;
++                    row.burg[0] = ba.x; row.burg[1] = ba.y; row.burg[2] = ba.z;
++                    row.burg2[0] = bb.x; row.burg2[1] = bb.y; row.burg2[2] = bb.z;
++                    row.swept_area_m2 = arrhenius_selected[row_id] ?
++                        candidate.swept_area_m2 : 0.0;
++                    row.plastic_strain_increment = arrhenius_selected[row_id] ?
++                        candidate.plastic_strain_increment : 0.0;
+                 }
+                 const Vec3 p0 = smn->splitpos(row_id, 0);
+                 const Vec3 p1 = smn->splitpos(row_id, 1);
+@@ -1007,8 +1057,11 @@ public:
+                 double best_hazard_score = -1.0;
+                 const NodeTag tag = network->nodes[i].tag;
+                 const Vec3 original = network->nodes[i].pos;
+-                const double work_scale_J =
+-                    std::pow(system->params.burgmag, 3);
++                const double b_m = system->params.burgmag;
++                const double work_scale_J = std::pow(b_m, 3);
++                const double force_scale_N = b_m * b_m;
++                const double volume_m3 = network->cell.volume() *
++                                         std::pow(b_m, 3);
+ 
+                 for (int row_id = split_begin; row_id < isplit; ++row_id) {
+                     CandidateKinetics& candidate = kinetics[row_id];
+@@ -1035,10 +1088,106 @@ public:
+                     candidate.trial_work_J = 0.5 *
+                         (dot(f_before + f_after0, dx0) +
+                          dot(f_before + f_after1, dx1)) * work_scale_J;
+-                    const double tau_eff = candidate.trial_work_J /
+-                                           p.barrier.vstar_m3;
+-                    candidate.evaluation = Arrhenius::evaluate(
+-                        tau_eff, p.temperature_K, system->realdt, p.barrier);
++
++                    Vec3 q = q1 - q0;
++                    if (q.norm2() <= 0.0) q = dx1.norm2() > 0.0 ? dx1 : dx0;
++                    if (q.norm2() > 0.0) q = q.normalized();
++                    int best_arm_a = -1, best_arm_b = -1;
++                    double best_align_a = -1.0, best_align_b = -1.0;
++                    for (int arm = 0; arm < nconn; ++arm) {
++                        const int neighbor = network->conn[i].node[arm];
++                        Vec3 tangent = network->cell.pbc_position(
++                            original, network->nodes[neighbor].pos) - original;
++                        if (tangent.norm2() <= 0.0) continue;
++                        tangent = tangent.normalized();
++                        const double alignment = std::fabs(dot(tangent, q));
++                        if (alignment > best_align_a) {
++                            best_align_b = best_align_a;
++                            best_arm_b = best_arm_a;
++                            best_align_a = alignment;
++                            best_arm_a = arm;
++                        } else if (alignment > best_align_b) {
++                            best_align_b = alignment;
++                            best_arm_b = arm;
++                        }
++                    }
++                    if (best_arm_b < 0) best_arm_b = best_arm_a;
++
++                    Arrhenius::TaylorInteractionInput& input =
++                        candidate.taylor_input;
++                    input.mechanism_id = candidate.event_class;
++                    input.candidate_id = splits(row_id,1);
++                    input.node_id = i;
++                    input.junction_id = i;
++                    input.b_m = b_m;
++                    input.mu_Pa = system->params.MU;
++                    input.alpha_line_tension = p.taylor.line_tension_alpha;
++                    input.event_direction = q;
++                    input.x_dagger_m = p.taylor.x_dagger_m;
++                    input.vstar_m3 = p.barrier.vstar_m3;
++                    input.dt_s = system->realdt;
++                    input.temperature_K = p.temperature_K;
++                    input.native_force_before_N = force_scale_N * f_before;
++                    input.native_force_after_N = force_scale_N *
++                        (0.5 * (f_after0 + f_after1));
++                    input.native_force_available = true;
++                    const double trial_coordinate_m = 0.5 *
++                        (dx0.norm() + dx1.norm()) * b_m;
++                    input.native_projected_force_available =
++                        trial_coordinate_m > 0.0;
++                    input.native_projected_force_N = trial_coordinate_m > 0.0 ?
++                        candidate.trial_work_J / trial_coordinate_m : 0.0;
++                    input.trial_displacement_m = 0.5 * b_m * (dx0 + dx1);
++
++                    auto set_arm = [&](int arm, bool first) {
++                        if (arm < 0) return;
++                        const int neighbor = network->conn[i].node[arm];
++                        const int segment = network->conn[i].seg[arm];
++                        const Vec3 dr = network->cell.pbc_position(
++                            original, network->nodes[neighbor].pos) - original;
++                        const Vec3 tangent = dr.norm2() > 0.0 ?
++                            dr.normalized() : Vec3(0.0);
++                        const Vec3 burgers = b_m * network->segs[segment].burg;
++                        if (first) {
++                            input.seg_id_a = segment;
++                            input.line_direction_a = tangent;
++                            input.burgers_a = burgers;
++                            input.L_left_m = dr.norm() * b_m;
++                            input.plane_normal = network->segs[segment].plane.normalized();
++                        } else {
++                            input.seg_id_b = segment;
++                            input.line_direction_b = tangent;
++                            input.burgers_b = burgers;
++                            input.L_right_m = dr.norm() * b_m;
++                        }
++                    };
++                    set_arm(best_arm_a, true);
++                    set_arm(best_arm_b, false);
++                    input.L_eff_m = Arrhenius::harmonic_adjacent_arm_length(
++                        input.L_left_m, input.L_right_m);
++                    if (input.burgers_a.norm2() > 0.0 &&
++                        input.plane_normal.norm2() > 0.0) {
++                        input.tau_app_resolved_Pa = dot(
++                            input.burgers_a.normalized(),
++                            system->extstress * input.plane_normal.normalized());
++                    }
++                    candidate.taylor_output =
++                        Arrhenius::evaluate_taylor_interaction(
++                            input, p.barrier, p.taylor.force_source);
++                    const Arrhenius::TaylorInteractionOutput& taylor =
++                        candidate.taylor_output;
++                    candidate.evaluation.tau_eff_Pa = taylor.tau_eff_Pa;
++                    candidate.evaluation.activation_work_J = taylor.work_bias_J;
++                    candidate.evaluation.G_eV = taylor.G_eV;
++                    candidate.evaluation.G_floor_eV = taylor.G_floor_eV;
++                    candidate.evaluation.G_used_eV = taylor.G_used_eV;
++                    candidate.evaluation.rate_s = taylor.rate_s;
++                    candidate.evaluation.Rdt = taylor.Rdt;
++                    candidate.evaluation.probability = taylor.probability;
++                    candidate.swept_area_m2 = 0.5 *
++                        (input.L_left_m + input.L_right_m) * trial_coordinate_m;
++                    candidate.plastic_strain_increment = volume_m3 > 0.0 ?
++                        b_m * candidate.swept_area_m2 / volume_m3 : 0.0;
+                     const int split_id = splits(row_id,1);
+                     const std::uint64_t key = Arrhenius::event_key(
+                         tag.domain, tag.index, candidate.event_class, split_id);
+diff --git a/src/arrhenius/taylor_line_tension_interaction.h b/src/arrhenius/taylor_line_tension_interaction.h
+new file mode 100644
+index 0000000..47bb34d
+--- /dev/null
++++ b/src/arrhenius/taylor_line_tension_interaction.h
+@@ -0,0 +1,168 @@
++/*---------------------------------------------------------------------------
++ * Shared single-glider Taylor force-work kernel for D-D interactions.
++ *-------------------------------------------------------------------------*/
++
++#pragma once
++#ifndef EXADIS_ARRHENIUS_TAYLOR_LINE_TENSION_INTERACTION_H
++#define EXADIS_ARRHENIUS_TAYLOR_LINE_TENSION_INTERACTION_H
++
++#include "arrhenius/arrhenius_exp_floor.h"
++
++#include <cmath>
++#include <string>
++
++namespace ExaDiS {
++namespace Arrhenius {
++
++enum TaylorForceSource {
++    NATIVE_TRIAL_FORCE_PREFERRED = 0,
++    LINE_TENSION_RECONSTRUCTION = 1
++};
++
++struct TaylorInteractionParams {
++    double x_dagger_m = -1.0;
++    double line_tension_alpha = 0.5;
++    TaylorForceSource force_source = NATIVE_TRIAL_FORCE_PREFERRED;
++};
++
++struct TaylorInteractionInput {
++    int mechanism_id = -1;
++    int candidate_id = -1;
++    int node_id = -1;
++    int seg_id_a = -1;
++    int seg_id_b = -1;
++    int junction_id = -1;
++
++    double b_m = 0.0;
++    double mu_Pa = 0.0;
++    double alpha_line_tension = 0.5;
++
++    Vec3 event_direction;
++    Vec3 line_direction_a;
++    Vec3 line_direction_b;
++    Vec3 burgers_a;
++    Vec3 burgers_b;
++    Vec3 plane_normal;
++
++    double L_left_m = 0.0;
++    double L_right_m = 0.0;
++    double L_eff_m = 0.0;
++
++    double x_dagger_m = 0.0;
++    double vstar_m3 = 0.0;
++
++    Vec3 native_force_before_N;
++    Vec3 native_force_after_N;
++    Vec3 trial_displacement_m;
++    bool native_force_available = false;
++    bool native_projected_force_available = false;
++    double native_projected_force_N = 0.0;
++
++    double tau_app_resolved_Pa = 0.0;
++    double dt_s = 0.0;
++    double temperature_K = 0.0;
++};
++
++struct TaylorInteractionOutput {
++    double line_tension_N = 0.0;
++    double F_line_tension_N = 0.0;
++    double F_native_projected_N = 0.0;
++    double F_event_N = 0.0;
++
++    double native_trial_work_J = 0.0;
++    double work_bias_J = 0.0;
++    double tau_eff_Pa = 0.0;
++    double phi_eff = 0.0;
++    double phi_geom_L_over_b = 0.0;
++
++    double L_min_m = 0.0;
++    double L_harmonic_m = 0.0;
++    double L_sum_m = 0.0;
++    double L_eff_m = 0.0;
++
++    double G_eV = 0.0;
++    double G_floor_eV = 0.0;
++    double G_used_eV = 0.0;
++    double rate_s = 0.0;
++    double Rdt = 0.0;
++    double probability = 0.0;
++
++    TaylorForceSource force_source_used = NATIVE_TRIAL_FORCE_PREFERRED;
++};
++
++KOKKOS_INLINE_FUNCTION
++double harmonic_adjacent_arm_length(double left_m, double right_m)
++{
++    if (!(left_m > 0.0)) return right_m > 0.0 ? right_m : 0.0;
++    if (!(right_m > 0.0)) return left_m;
++    return 2.0 / (1.0 / left_m + 1.0 / right_m);
++}
++
++KOKKOS_INLINE_FUNCTION
++TaylorInteractionOutput evaluate_taylor_interaction(
++    const TaylorInteractionInput& input, const ExpFloorParams& barrier,
++    TaylorForceSource requested_source=NATIVE_TRIAL_FORCE_PREFERRED)
++{
++    TaylorInteractionOutput out;
++    const double left = input.L_left_m > 0.0 ? input.L_left_m : 0.0;
++    const double right = input.L_right_m > 0.0 ? input.L_right_m : 0.0;
++    out.L_min_m = left > 0.0 && right > 0.0 ?
++        (left < right ? left : right) : (left > right ? left : right);
++    out.L_harmonic_m = harmonic_adjacent_arm_length(left, right);
++    out.L_sum_m = left + right;
++    out.L_eff_m = input.L_eff_m > 0.0 ? input.L_eff_m : out.L_harmonic_m;
++
++    Vec3 q = input.event_direction;
++    if (q.norm2() > 0.0) q = q.normalized();
++    Vec3 ta = input.line_direction_a;
++    Vec3 tb = input.line_direction_b;
++    if (ta.norm2() > 0.0) ta = ta.normalized();
++    if (tb.norm2() > 0.0) tb = tb.normalized();
++
++    out.line_tension_N = input.alpha_line_tension * input.mu_Pa *
++                         input.b_m * input.b_m;
++    out.F_line_tension_N = out.line_tension_N * dot(ta + tb, q);
++
++    const Vec3 mean_native = 0.5 *
++        (input.native_force_before_N + input.native_force_after_N);
++    out.F_native_projected_N = input.native_projected_force_available ?
++        input.native_projected_force_N : dot(mean_native, q);
++    out.native_trial_work_J = dot(mean_native, input.trial_displacement_m);
++
++    const bool use_native = requested_source == NATIVE_TRIAL_FORCE_PREFERRED &&
++        (input.native_projected_force_available || input.native_force_available);
++    out.force_source_used = use_native ? NATIVE_TRIAL_FORCE_PREFERRED :
++                                         LINE_TENSION_RECONSTRUCTION;
++    out.F_event_N = use_native ? out.F_native_projected_N :
++                                out.F_line_tension_N;
++
++    // This is the only mechanical amplification entering the barrier. L_eff/b
++    // is deliberately diagnostic and is never multiplied into force work.
++    out.work_bias_J = out.F_event_N * input.x_dagger_m;
++    out.tau_eff_Pa = input.vstar_m3 > 0.0 ?
++        out.work_bias_J / input.vstar_m3 : 0.0;
++    out.phi_eff = std::fabs(input.tau_app_resolved_Pa) > 1.0e-30 ?
++        out.tau_eff_Pa / input.tau_app_resolved_Pa : 0.0;
++    out.phi_geom_L_over_b = input.b_m > 0.0 ?
++        out.L_eff_m / input.b_m : 0.0;
++
++    const Evaluation eval = evaluate(
++        out.tau_eff_Pa, input.temperature_K, input.dt_s, barrier);
++    out.G_eV = eval.G_eV;
++    out.G_floor_eV = eval.G_floor_eV;
++    out.G_used_eV = eval.G_used_eV;
++    out.rate_s = eval.rate_s;
++    out.Rdt = eval.Rdt;
++    out.probability = eval.probability;
++    return out;
++}
++
++const char* taylor_force_source_name(TaylorForceSource source);
++void validate_taylor_interaction(const TaylorInteractionParams& params,
++                                 const ExpFloorParams& barrier,
++                                 const std::string& mechanism);
++
++} // namespace Arrhenius
++} // namespace ExaDiS
++
++#endif
+diff --git a/src/arrhenius/taylor_line_tension_interaction.cpp b/src/arrhenius/taylor_line_tension_interaction.cpp
+new file mode 100644
+index 0000000..34beff0
+--- /dev/null
++++ b/src/arrhenius/taylor_line_tension_interaction.cpp
+@@ -0,0 +1,35 @@
++#include "arrhenius/taylor_line_tension_interaction.h"
++
++#include <sstream>
++#include <stdexcept>
++
++namespace ExaDiS {
++namespace Arrhenius {
++
++const char* taylor_force_source_name(TaylorForceSource source)
++{
++    switch (source) {
++    case NATIVE_TRIAL_FORCE_PREFERRED: return "native_trial";
++    case LINE_TENSION_RECONSTRUCTION: return "line_tension_reconstruction";
++    default: return "unknown";
++    }
++}
++
++void validate_taylor_interaction(const TaylorInteractionParams& params,
++                                 const ExpFloorParams& barrier,
++                                 const std::string& mechanism)
++{
++    std::ostringstream errors;
++    if (!(std::isfinite(params.x_dagger_m) && params.x_dagger_m > 0.0))
++        errors << " x_dagger_m";
++    if (!(std::isfinite(params.line_tension_alpha) &&
++          params.line_tension_alpha > 0.0))
++        errors << " line_tension_alpha";
++    if (!errors.str().empty())
++        throw std::invalid_argument(
++            "invalid Taylor interaction parameters for " + mechanism + ":" +
++            errors.str());
++}
++
++} // namespace Arrhenius
++} // namespace ExaDiS

@@ -1,0 +1,33 @@
+{
+  "temperature_K": 900.0,
+  "eta0_default_s": 1000000000000.0,
+  "mobility_peierls": {
+    "replacement_eligible": true,
+    "H_eV": 0.04819349051199606,
+    "S_kB": -0.15164376817344127,
+    "sigma_c_GPa": 0.039583654511514035,
+    "f": 0.024310824237702533,
+    "a": 36.50895532789194,
+    "n": 0.9325720424960138,
+    "jump_b": 0.23154770572269381,
+    "vstar_b3": 390.8009690090542,
+    "vmax": 4000.0,
+    "anisotropic_coupling": {
+      "a_nn": 0.0,
+      "a_mm": 0.0,
+      "a_np": 0.0,
+      "a_other": 0.0,
+      "abs_effective_stress": false
+    }
+  },
+  "topology": {
+    "replacement_eligible": false
+  },
+  "cross_slip": {
+    "replacement_eligible": false
+  },
+  "collision": {
+    "replacement_eligible": false,
+    "reason": "observed candidates are deterministic core-overlap geometry"
+  }
+}

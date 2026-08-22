@@ -1,0 +1,99 @@
+{
+  "status": "passed_with_documented_density_limit",
+  "repository_base_sha": "10f1eb0e7601fa437999700ad2e7538277d3331f",
+  "exadis_source_sha": "20ea2e82cdb919581c0611c338a6e46f6ad3f008",
+  "implementation": {
+    "native_arrhenius_mobility": true,
+    "native_arrhenius_topology": true,
+    "native_arrhenius_cross_slip": true,
+    "persistent_residence_hazard": true,
+    "independent_pathways_compete_in_hazard_space": true,
+    "tensorial_activation_work": true,
+    "non_schmid_terms": true,
+    "deterministic_collision_preserved": true,
+    "stock_behavior_is_default": true
+  },
+  "builds": {
+    "audit_enabled": {
+      "path": "core/exadis/build-audit-llvm",
+      "compiled": true,
+      "python_driver_exposes_enable_audit": true
+    },
+    "audit_disabled": {
+      "path": "core/exadis/build-noaudit-llvm",
+      "compiled": true,
+      "python_driver_exposes_enable_audit": false
+    }
+  },
+  "audit_invariance": {
+    "status": "passed",
+    "exact_for_all_compared_fields": true,
+    "result": "results/exadis_native_arrhenius_A3_final_v3/invariance_summary.json",
+    "stress_Pa": 30633.535962521833,
+    "density_m2": 1153113920287.591,
+    "nodes": 10917,
+    "segments": 11791,
+    "network_sha256": "14e67dd977dfd9722cd963249b7232f238d036f402b2c990efd517aea0ae6914",
+    "cross_slip": {
+      "rows": 337,
+      "kinetic_rows": 128,
+      "accepted_arrhenius": 15,
+      "deterministic_high_hazard": 4,
+      "Rdt_max": 89.55699369472045
+    },
+    "topology": {
+      "rows": 2160,
+      "kinetic_rows": 125,
+      "accepted_arrhenius": 68,
+      "deterministic_high_hazard": 77,
+      "Rdt_max": 76.41698031764751
+    }
+  },
+  "stock_reference_gate": {
+    "status": "passed",
+    "tolerance": 0.3,
+    "result": "results/exadis_native_arrhenius_A3_final_v3/stage_validation.json",
+    "stress_peak_normalized_difference": 0.008528603862056214,
+    "stress_normalized_rmse": 0.006058965200572358,
+    "final_density_relative_difference": 0.000004473888891431384,
+    "final_node_count_relative_difference": 0.0011893870082342176,
+    "final_segment_count_relative_difference": 0.0005933209018477708
+  },
+  "temperature_rate_sweep": {
+    "status": "passed",
+    "result": "results/exadis_native_arrhenius_physics_long_v1/physics_trend_validation.json",
+    "temperatures_K": [300, 500, 700, 900, 1100],
+    "strain_rates_per_s": [10, 100, 1000, 10000],
+    "case_count": 20,
+    "comparison_strain": 2.2e-7,
+    "relative_stochastic_slack": 0.05,
+    "higher_rate_strengthens": true,
+    "higher_temperature_softens_or_is_athermal": true,
+    "all_networks_sane": true,
+    "all_hazards_finite": true,
+    "all_arrhenius_decisions_audited": true,
+    "large_Rdt_scheme_documented": true
+  },
+  "initial_density_sweep": {
+    "status": "passed_as_plateau_with_limit",
+    "result": "results/exadis_native_arrhenius_density_flow_final/physics_density_validation.json",
+    "density_factors": [0.5, 1.0, 2.0],
+    "comparison_strain": 0.00000204990848,
+    "all_networks_sane": true,
+    "initial_and_final_densities_ordered": true,
+    "density_plateau_observed": true,
+    "taylor_like_strengthening_observed": false,
+    "regime": "athermal_density_plateau_without_resolved_taylor_strengthening"
+  },
+  "patch_stack": {
+    "status": "passed",
+    "ordered_patch_count": 4,
+    "native_files_reproduced_exactly": 23,
+    "diff_check_clean": true
+  },
+  "model_scope": {
+    "classification": "calibrated_mechanism_surrogate",
+    "universal_material_constants_claimed": false,
+    "warning": "Barrier laws may depend on dislocation character, stress, temperature, junction character, chemistry, image forces, and other state variables not identified by the present calibration trajectories."
+  }
+}
