@@ -13,6 +13,7 @@ MAX_STRAIN="${MAX_STRAIN:-1.0e-5}"
 STRAIN_RATE="${STRAIN_RATE:-1.0e3}"
 DENSITY_FACTOR="${DENSITY_FACTOR:-1.0}"
 MINIMUM_STEPS="${MINIMUM_STEPS:-0}"
+INTERACTION_PARAMETER_SET="${INTERACTION_PARAMETER_SET:-}"
 AUDIT_STRIDE="${AUDIT_STRIDE:-1}"
 PRINT_FREQ="${PRINT_FREQ:-1}"
 OUTPUT_FREQUENCY="${OUTPUT_FREQUENCY:-2000000000}"
@@ -76,6 +77,9 @@ if [[ -n "$REQUIRE_CANDIDATE_LABELS" ]]; then
   for mechanism in "${required_mechanisms[@]}"; do
     args+=(--require-candidate-labels "$mechanism")
   done
+fi
+if [[ -n "$INTERACTION_PARAMETER_SET" ]]; then
+  args+=(--interaction-parameter-set "$INTERACTION_PARAMETER_SET")
 fi
 
 PYTHONPATH="$EXADIS_PYTHON_DIR:$PYEXADIS_DIR:${PYTHONPATH:-}" \

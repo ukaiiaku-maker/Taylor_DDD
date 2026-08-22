@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate density scaling and a low-temperature Taylor-like strength trend."""
+"""Validate high-barrier Taylor scaling; a density plateau is a hard failure."""
 
 from __future__ import annotations
 
@@ -48,21 +48,44 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", action="append", required=True)
     parser.add_argument("--relative-slack", type=float, default=0.02)
+    parser.add_argument(
+        "--comparison-strains", default="2e-7,1e-6,2e-6,5e-6,1e-5"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     cases = sorted((_load_case(spec) for spec in args.case), key=lambda row: row["density_factor"])
-    comparison_strain = min(row["final_strain"] for row in cases)
+    maximum_common_strain = min(row["final_strain"] for row in cases)
+    requested_strains = [float(value) for value in args.comparison_strains.split(",")]
+    comparison_strains = [value for value in requested_strains if value <= maximum_common_strain]
+    if not comparison_strains:
+        comparison_strains = [maximum_common_strain]
+    density = np.asarray([row["initial_density_m2"] for row in cases])
+    strain_checks = []
+    for comparison_strain in comparison_strains:
+        stresses = np.asarray([
+            np.interp(comparison_strain, row["_strain_stress"][:, 0], row["_strain_stress"][:, 1])
+            for row in cases
+        ])
+        positive = stresses > 0.0
+        slope = float(np.polyfit(np.log(density[positive]), np.log(stresses[positive]), 1)[0]) \
+            if np.count_nonzero(positive) >= 3 else float("nan")
+        strengthening = _nondecreasing(stresses.tolist(), 0.0)
+        strain_checks.append({
+            "strain": comparison_strain,
+            "stress_Pa_by_density": stresses.tolist(),
+            "log_stress_log_density_slope": slope,
+            "strictly_strengthening": bool(strengthening),
+            "taylor_slope_0p4_to_0p6": bool(
+                math.isfinite(slope) and 0.4 <= slope <= 0.6
+            ),
+        })
     for row in cases:
-        curve = row.pop("_strain_stress")
-        row["comparison_strain"] = comparison_strain
-        row["comparison_stress_Pa"] = float(
-            np.interp(comparison_strain, curve[:, 0], curve[:, 1])
-        )
-    stresses = [row["comparison_stress_Pa"] for row in cases]
-    strictly_strengthening = _nondecreasing(stresses, 0.0)
-    stress_scale = max(1.0, max(abs(value) for value in stresses))
-    density_plateau = (max(stresses) - min(stresses)) / stress_scale <= args.relative_slack
+        row.pop("_strain_stress")
+    taylor_windows = [
+        check for check in strain_checks
+        if check["strictly_strengthening"] and check["taylor_slope_0p4_to_0p6"]
+    ]
     gates = {
         "at_least_three_densities": len(cases) >= 3,
         "requested_factors_applied": all(
@@ -75,22 +98,21 @@ def main() -> int:
         "final_density_increases": _nondecreasing(
             [row["final_density_m2"] for row in cases], args.relative_slack
         ),
-        "density_response_is_taylor_like_or_plateau": (
-            strictly_strengthening or density_plateau
+        "density_factors_span_at_least_one_decade": bool(
+            density[-1] / density[0] >= 10.0
         ),
+        "taylor_slope_observed_at_common_strain": bool(taylor_windows),
         "all_networks_sane": all(row["network_sane"] for row in cases),
     }
     passed = all(gates.values())
     report = {
         "status": "passed" if passed else "failed",
-        "regime": (
-            "taylor_like_strengthening" if strictly_strengthening
-            else "athermal_density_plateau_without_resolved_taylor_strengthening"
-        ),
-        "taylor_like_strengthening_observed": strictly_strengthening,
-        "density_plateau_observed": density_plateau,
+        "regime": "taylor_like_strengthening" if taylor_windows else "taylor_scaling_not_resolved",
+        "taylor_like_strengthening_observed": bool(taylor_windows),
+        "density_plateau_is_accepted": False,
         "relative_slack": args.relative_slack,
-        "comparison_strain": comparison_strain,
+        "comparison_strains": comparison_strains,
+        "strain_checks": strain_checks,
         "cases": cases,
         "gates": gates,
     }

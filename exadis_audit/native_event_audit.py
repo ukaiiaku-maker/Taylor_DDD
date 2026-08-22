@@ -51,6 +51,42 @@ def _network_digest(system: Any) -> str:
     return digest.hexdigest()
 
 
+def _network_line_diagnostics(system: Any, burgers_m: float) -> dict[str, float]:
+    nodes = np.asarray(system.get_nodes_array(), dtype=float)
+    segs = np.asarray(system.get_segs_array(), dtype=float)
+    cell = system.get_cell()
+    volume_m3 = float(cell.volume()) * burgers_m**3
+    if segs.size == 0:
+        return {
+            "volume_m3": volume_m3,
+            "mobile_line_density_m2": 0.0,
+            "forest_intersecting_line_density_m2": 0.0,
+            "junction_density_m3": 0.0,
+            "mean_segment_length_m": 0.0,
+        }
+    nodeids = segs[:, :2].astype(int)
+    positions = nodes[:, 2:5]
+    r1 = positions[nodeids[:, 0]]
+    r2 = np.asarray(cell.closest_image(Rref=r1, R=positions[nodeids[:, 1]]))
+    lengths_m = np.linalg.norm(r2 - r1, axis=1) * burgers_m
+    degrees = np.bincount(nodeids.ravel(), minlength=len(nodes))
+    constraints = nodes[:, 5].astype(int)
+    mobile = (constraints[nodeids[:, 0]] == 0) & (constraints[nodeids[:, 1]] == 0)
+    junction_seg = np.linalg.norm(segs[:, 2:5], axis=1) > 1.01
+    intersects = (
+        (degrees[nodeids[:, 0]] >= 3) |
+        (degrees[nodeids[:, 1]] >= 3) |
+        junction_seg
+    )
+    return {
+        "volume_m3": volume_m3,
+        "mobile_line_density_m2": float(lengths_m[mobile].sum() / volume_m3),
+        "forest_intersecting_line_density_m2": float(lengths_m[intersects].sum() / volume_m3),
+        "junction_density_m3": float(np.count_nonzero(degrees >= 3) / volume_m3),
+        "mean_segment_length_m": float(np.mean(lengths_m)),
+    }
+
+
 def _network_density_m2(graph: Any, burgers_m: float) -> float:
     """Compute line density for an ExaDisNet, including periodic images."""
     data = graph.export_data()
@@ -307,17 +343,38 @@ def _arrhenius_discrete_params(
         )
     coupling = block.get("anisotropic_coupling", {})
     site_multiplicity = float(block.get("site_multiplicity", 1.0))
-    stress_concentration = float(block.get("stress_concentration_phi", 1.0))
-    intrinsic_vstar = float(
-        block.get("intrinsic_activation_volume_b3", block["vstar_b3"])
-    )
-    effective_vstar = stress_concentration * intrinsic_vstar
     if site_multiplicity <= 0.0:
         raise ValueError(f"Arrhenius {mechanism} site_multiplicity must be positive")
-    if not np.isclose(effective_vstar, float(block["vstar_b3"]), rtol=1e-12):
+    if "stress_concentration_phi" in block:
         raise ValueError(
-            f"Arrhenius {mechanism} requires vstar_b3 = "
-            "stress_concentration_phi * intrinsic_activation_volume_b3"
+            f"Arrhenius {mechanism} must not impose stress_concentration_phi; "
+            "the native Taylor force-work kernel audits phi_eff"
+        )
+    if block.get("stress_concentration_mode") != "single_glider_line_tension_force_work":
+        raise ValueError(
+            f"Arrhenius {mechanism} requires "
+            "stress_concentration_mode=single_glider_line_tension_force_work"
+        )
+    if block.get("L_eff_mode") != "harmonic_adjacent_arms":
+        raise ValueError(
+            f"Arrhenius {mechanism} requires L_eff_mode=harmonic_adjacent_arms"
+        )
+    force_source_name = block.get(
+        "force_work_source", "native_trial_force_preferred"
+    )
+    force_source_values = {
+        "native_trial_force_preferred": 0,
+        "line_tension_reconstruction": 1,
+    }
+    if force_source_name not in force_source_values:
+        raise ValueError(
+            f"Arrhenius {mechanism} has unsupported force_work_source={force_source_name}"
+        )
+    x_dagger_b = float(block.get("x_dagger_b", 0.0))
+    line_tension_alpha = float(block.get("line_tension_alpha", 0.0))
+    if x_dagger_b <= 0.0 or line_tension_alpha <= 0.0:
+        raise ValueError(
+            f"Arrhenius {mechanism} requires positive x_dagger_b and line_tension_alpha"
         )
     prefactor_exponent = float(
         block.get("attempt_frequency_temperature_exponent", 0.0)
@@ -342,7 +399,7 @@ def _arrhenius_discrete_params(
         float(block["a"]),
         float(block["n"]),
         eta0_effective,
-        effective_vstar,
+        float(block["vstar_b3"]),
         float(args.burgers),
         float(coupling.get("a_nn", 0.0)),
         float(coupling.get("a_mm", 0.0)),
@@ -350,6 +407,9 @@ def _arrhenius_discrete_params(
         float(coupling.get("a_tc", coupling.get("a_other", 0.0))),
         float(block.get("high_hazard_Rdt", 20.0)),
         int(block.get("seed", 1469598103934665603 + seed_offset)),
+        x_dagger_b,
+        line_tension_alpha,
+        force_source_values[force_source_name],
     )
 
 
@@ -369,10 +429,22 @@ def _arrhenius_event_family(
     missing = [name for name in names if not isinstance(mechanisms.get(name), dict)]
     if missing:
         raise ValueError(f"Arrhenius {family} lacks mechanism blocks: {', '.join(missing)}")
-    return [
-        _arrhenius_discrete_params(args, name, mechanisms[name], index)
-        for index, name in enumerate(names)
-    ]
+    parameter_sets = args.arrhenius_config_data.get("interaction_parameter_sets", {})
+    resolved = []
+    for index, name in enumerate(names):
+        block = mechanisms[name]
+        parameter_set = args.interaction_parameter_set or block.get("parameter_set")
+        if parameter_set is not None:
+            base = parameter_sets.get(parameter_set)
+            if not isinstance(base, dict):
+                raise ValueError(
+                    f"Arrhenius {name} references missing interaction parameter set "
+                    f"{parameter_set}"
+                )
+            block = ({**block, **base} if args.interaction_parameter_set
+                     else {**base, **block})
+        resolved.append(_arrhenius_discrete_params(args, name, block, index))
+    return resolved
 
 
 def _build_modules(state: dict[str, Any], net: Any, args: argparse.Namespace):
@@ -530,6 +602,7 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
 
     mechanisms, labels = _audit_counts(audit_path)
     discrete_metrics = _discrete_audit_metrics(audit_path)
+    line_diagnostics = _network_line_diagnostics(system, args.burgers)
     summary = {
         "audit_enabled": audit_enabled,
         "density_factor": float(args.density_factor),
@@ -554,6 +627,7 @@ def _run_case(args: argparse.Namespace, outdir: Path, audit_enabled: bool) -> di
         "audit_rows_by_mechanism": mechanisms,
         "candidate_labels_by_mechanism": labels,
         "arrhenius_discrete_audit": discrete_metrics,
+        **line_diagnostics,
     }
     (outdir / "final_summary.json").write_text(
         json.dumps(_clean(summary), indent=2, sort_keys=True) + "\n"
@@ -635,6 +709,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--arrhenius-temperature-K", type=float, default=None)
     parser.add_argument("--arrhenius-eta0-default", type=float, default=1.0e12)
     parser.add_argument("--arrhenius-config", type=Path, default=None)
+    parser.add_argument(
+        "--interaction-parameter-set", default=None,
+        help="override every D-D mechanism with a named interaction_parameter_sets block",
+    )
     parser.add_argument(
         "--require-candidate-labels",
         action="append",

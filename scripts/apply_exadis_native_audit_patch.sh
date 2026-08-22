@@ -18,6 +18,7 @@ else
     "$ROOT_DIR/exadis_native_patches/0002-native-arrhenius-exp-floor.patch"
     "$ROOT_DIR/exadis_native_patches/0003-native-discrete-arrhenius-events.patch"
     "$ROOT_DIR/exadis_native_patches/0004-native-discrete-hazard-state.patch"
+    "$ROOT_DIR/exadis_native_patches/0005-native-taylor-line-tension-force-work.patch"
   )
 fi
 for patch in "${patches[@]}"; do
@@ -52,14 +53,23 @@ for patch in "${patches[@]}"; do
       fi
       ;;
     0003-native-discrete-arrhenius-events.patch)
-      if grep -q "junction_reconfiguration" "$EXADIS_ROOT/src/topology.h" &&
-         grep -q "zipper_propagation" "$EXADIS_ROOT/src/cross_slip.h"; then
+      if grep -q "JUNCTION_RECONFIGURATION" "$EXADIS_ROOT/src/topology.h" &&
+         grep -q "ZIPPER_PROPAGATION" "$EXADIS_ROOT/src/cross_slip.h"; then
         patch_present=1
       fi
       ;;
     0004-native-discrete-hazard-state.patch)
       if [[ -f "$EXADIS_ROOT/src/arrhenius/discrete_hazard.h" ]] &&
          grep -q "class ResidenceHazard" "$EXADIS_ROOT/src/arrhenius/discrete_hazard.h"; then
+        patch_present=1
+      fi
+      ;;
+    0005-native-taylor-line-tension-force-work.patch)
+      if [[ -f "$EXADIS_ROOT/src/arrhenius/taylor_line_tension_interaction.h" ]] &&
+         grep -q "evaluate_taylor_interaction" \
+           "$EXADIS_ROOT/src/topology_types/topology_parallel.h" &&
+         grep -q "evaluate_taylor_interaction" \
+           "$EXADIS_ROOT/src/cross_slip_types/cross_slip_parallel.h"; then
         patch_present=1
       fi
       ;;
